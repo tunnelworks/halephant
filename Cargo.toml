@@ -1,0 +1,124 @@
+[workspace]
+resolver = "3"
+members = ["crates/halephant", "crates/halephant-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/tunnelworks/halephant"
+authors = ["Tunnelworks Inc."]
+description = "A proxy and pooler for Postgres"
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1.50", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+humantime = "2"
+humantime-serde = "1.1.1"
+
+# Protocol & Parsing
+bytes = "1.11"
+chumsky = "1.0.0-alpha.8"
+sql_lexer = "0.9"
+
+# Cryptography
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+rand = "0.9"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+subtle = "2"
+
+# Error Handling
+thiserror = "2.0"
+anyhow = "1"
+
+# HTTP / Admin API
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+    "tracing",
+] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+# System
+socket2 = "0.5"
+arc-swap = "1"
+tempfile = "3"
+parking_lot = "0.12"
+moka = { version = "0.12", features = ["future"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.31", default-features = false, features = [
+    "trace",
+    "metrics",
+    "logs",
+] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+    "trace",
+    "metrics",
+    "logs",
+] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+    "trace",
+    "metrics",
+    "logs",
+    "grpc-tonic",
+] }
+opentelemetry-appender-tracing = { version = "0.31", default-features = false }
+tracing-opentelemetry = "0.32"
+
+# Internal crates
+halephant-core = { version = "*", path = "crates/halephant-core" }
+
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+elided_lifetimes_in_paths = "warn"
+unreachable_pub = "warn"
+trivial_numeric_casts = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Correctness
+await_holding_lock = "warn"
+large_futures = "warn"
+unwrap_used = "warn"
+panic = "warn"
+todo = "warn"
+exit = "warn"
+mem_forget = "warn"
+# Production hygiene
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+# Cherry-picked
+str_to_string = "warn"
+redundant_clone = "warn"
+# Pedantic overrides (too noisy)
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+items_after_statements = "allow"
+similar_names = "allow"
+wildcard_imports = "allow"

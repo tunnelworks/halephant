@@ -1,0 +1,15 @@
+# Local development config. Assumes a PostgreSQL instance on localhost:5432.
+
+[server]
+listen = ["127.0.0.1:6432"]
+
+[admin]
+listen = "127.0.0.1:6433"
+
+[logging]
+level = "info"
+
+[cluster.local]
+nodes = ["127.0.0.1:5432"]
+
+[cluster.local.pool.postgres.user.postgres]
