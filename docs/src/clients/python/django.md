@@ -2,9 +2,19 @@
 
 [Django](https://www.djangoproject.com/) is a Python web framework with built-in ORM and database routing.
 
-## SSL
+## Connection settings
 
-Disable SSL in the database options:
+Disable SSL and server-side cursors. Server-side cursors use `DECLARE ... CURSOR`, which holds state across
+statements — incompatible with transaction-mode pooling where the server connection may change between statements.
+
+Do NOT set `options` (such as `-c search_path=...`) in `OPTIONS` — halephant does not forward client startup
+parameters to the upstream because server connections are shared in transaction mode. Configure `search_path` and
+other GUCs in the halephant TOML instead:
+
+```toml [halephant.toml]
+[cluster.main.pool.myapp.user.myapp.parameters]
+options = { search_path = "myschema,public" }
+```
 
 ```python [settings.py]
 DATABASES = {
@@ -13,6 +23,7 @@ DATABASES = {
         "HOST": "halephant",
         "PORT": 6432,
         "OPTIONS": {"sslmode": "disable"},
+        "DISABLE_SERVER_SIDE_CURSORS": True,
         # ...
     },
 }
@@ -33,6 +44,7 @@ DATABASES = {
         "USER": "myapp",
         "PASSWORD": "...",
         "OPTIONS": {"sslmode": "disable"},
+        "DISABLE_SERVER_SIDE_CURSORS": True,
     },
     "replica": {
         "ENGINE": "django.db.backends.postgresql",
@@ -42,6 +54,7 @@ DATABASES = {
         "USER": "myapp_ro",
         "PASSWORD": "...",
         "OPTIONS": {"sslmode": "disable"},
+        "DISABLE_SERVER_SIDE_CURSORS": True,
     },
 }
 ```
