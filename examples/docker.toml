@@ -1,0 +1,18 @@
+# Default configuration shipped inside the halephant Docker image.
+#
+# This config connects to a PostgreSQL instance at "postgres:5432" —
+# adjust [cluster.local.nodes] to match your environment.
+
+[server]
+listen = ["0.0.0.0:6432"]
+
+[admin]
+listen = "0.0.0.0:6433"
+
+[logging]
+level = "info"
+
+[cluster.local]
+nodes = ["postgres:5432"]
+
+[cluster.local.pool.postgres.user.postgres]
