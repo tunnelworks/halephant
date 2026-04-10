@@ -2,12 +2,12 @@
 //!
 //! The module is split into three layers:
 //!
-//! - [`lexer`]: chumsky character-level tokenizer — handles nested
+//! - `lexer`: chumsky character-level tokenizer — handles nested
 //!   block comments, dollar-quoted strings, single-quoted strings with
 //!   `''` escapes, and double-quoted identifiers with `""` escapes.
-//! - [`parser`]: a tiny hand-written recursive-descent walker over the
+//! - `parser`: a tiny hand-written recursive-descent walker over the
 //!   token slice, producing a [`Statement`] AST.
-//! - [`ast`]: the AST — one variant per statement shape halephant
+//! - `ast`: the AST — one variant per statement shape halephant
 //!   cares about, with all relevant fields captured inline so
 //!   consumers never need a second extraction helper.
 //!

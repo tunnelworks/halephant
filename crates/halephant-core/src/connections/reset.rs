@@ -5,7 +5,7 @@
 //! Only RESETs GUC variables the previous client explicitly SET
 //! (tracked in [`super::server::ServerConn::dirty_vars`]); startup
 //! parameters like `application_name` and `search_path` are
-//! preserved across pool reuse. The [`BASE_RESET`] block runs on
+//! preserved across pool reuse. The `BASE_RESET` block runs on
 //! every reset regardless of dirty-var state — it covers
 //! non-GUC session state (cursors, LISTEN subscriptions, advisory
 //! locks, sequence caches, temp tables) that the previous client

@@ -17,12 +17,10 @@
 //!
 //! Shared pieces:
 //!
-//! - [`verifier`] — the [`ScramVerifier`] data type. Re-exported at
-//!   this module's top level because both the server state machine
-//!   and the verifier cache operate on it; forcing callers to write
-//!   `scram::verifier::ScramVerifier` would be noise.
-//! - [`crypto`] — HMAC-SHA256, SHA256, and the shared SCRAM message
-//!   attribute parser. Internal to the module.
+//! - `verifier` — the [`ScramVerifier`] data type (re-exported at
+//!   this module's top level).
+//! - `crypto` — HMAC-SHA256, SHA256, and the shared SCRAM message
+//!   attribute parser.
 //!
 //! `ScramServer` and `ScramClient` are intentionally NOT re-exported
 //! at this level: callers import them through their respective

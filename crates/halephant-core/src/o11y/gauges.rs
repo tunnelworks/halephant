@@ -1,9 +1,7 @@
 //! Observable gauge registration — callback-driven metrics that the
-//! OTel meter polls on each export cycle. Separated from
-//! [`crate::o11y::metrics`] because recorded metrics (counters,
-//! histograms) and observable metrics use different OTel APIs and
-//! have different lifetimes: the gauges here must be held alive for
-//! the process lifetime, while recorded metrics are fire-and-forget.
+//! OTel meter polls on each export cycle. Separated from the
+//! recorded metrics in `metrics` because observable gauges must be
+//! held alive for the process lifetime.
 
 use std::sync::Arc;
 

@@ -4,7 +4,7 @@
 //! The proxy's prepared-statement rewriter
 //! ([`crate::proxy::prepared`]) assigns each incoming client `Parse`
 //! a canonical name based on a hash of its query text and parameter
-//! types, then calls [`StatementStore::add_ref`] so every subsequent
+//! types, then calls `StatementStore::add_ref` so every subsequent
 //! client that submits the same statement text shares a single
 //! entry. When a server connection is missing a canonical statement,
 //! the pool looks up the original `Parse` via [`StatementStore::get`]

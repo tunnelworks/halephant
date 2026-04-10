@@ -7,8 +7,7 @@ use tokio::sync::oneshot;
 use crate::connections::server::ServerConn;
 
 /// Routing intent for connection resolution. Also used as the role
-/// discriminator in [`WaitKey`] — "I'm waiting for a writer" vs "I'm
-/// waiting for a reader".
+/// discriminator in wait queues.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Routing {
     Primary,
