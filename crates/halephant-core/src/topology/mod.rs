@@ -103,6 +103,20 @@ impl TopologyManager {
 
             // Detect role changes and collect affected nodes for draining.
             if let Some(prev) = prev {
+                // Total probe failure: every node is unreachable and no
+                // primary was found. Preserve the previous topology so a
+                // transient network blip doesn't erase a known-good
+                // primary and break all new connections until the next
+                // successful refresh.
+                if topo.primary.is_none() && topo.replicas.is_empty() {
+                    warn!(
+                        cluster = %name,
+                        unreachable = topo.unreachable.len(),
+                        "all probes failed, preserving previous topology"
+                    );
+                    continue;
+                }
+
                 if prev.primary != topo.primary {
                     // Old primary changed — drain it.
                     if let Some(ref old) = prev.primary {

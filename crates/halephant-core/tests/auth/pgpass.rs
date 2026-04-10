@@ -457,3 +457,43 @@ fn split_host_port_then_lookup() {
     assert_eq!(host, "::1");
     assert_eq!(pgpass.lookup(host, port, "mydb", "app"), Some("v6pass"));
 }
+
+// Admin connection lookup patterns — the admin password lookup uses
+// lookup_addr(admin_addr, admin_database, admin_user) where
+// admin_addr comes from topology (e.g. "postgres:5432").
+
+#[test]
+fn lookup_addr_host_wildcard_port_db_user() {
+    // host:*:*:username:pass — matches any port and any database
+    let pgpass = Pgpass::parse("postgres:*:*:halephant:secret");
+    assert_eq!(
+        pgpass.lookup_addr("postgres:5432", "postgres", "halephant"),
+        Some("secret")
+    );
+    assert_eq!(
+        pgpass.lookup_addr("postgres:5433", "mydb", "halephant"),
+        Some("secret")
+    );
+    assert_eq!(
+        pgpass.lookup_addr("other-host:5432", "postgres", "halephant"),
+        None
+    );
+}
+
+#[test]
+fn lookup_addr_all_wildcards_except_user() {
+    // *:*:*:username:pass — matches any host, port, database
+    let pgpass = Pgpass::parse("*:*:*:halephant:secret");
+    assert_eq!(
+        pgpass.lookup_addr("postgres:5432", "postgres", "halephant"),
+        Some("secret")
+    );
+    assert_eq!(
+        pgpass.lookup_addr("10.0.0.1:5433", "warehouse", "halephant"),
+        Some("secret")
+    );
+    assert_eq!(
+        pgpass.lookup_addr("postgres:5432", "postgres", "other-user"),
+        None
+    );
+}

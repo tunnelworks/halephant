@@ -8,7 +8,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -123,6 +122,17 @@ async fn forward_inner(
     let database = startup_param(&startup.parameters, "database");
     let user = startup_param(&startup.parameters, "user");
 
+    // Log client-supplied startup parameters that halephant does not
+    // forward. In transaction mode, server connections are shared so
+    // per-client startup parameters (options, application_name, etc.)
+    // cannot be forwarded — they would leak to the next client. These
+    // must be configured in the TOML per-user instead.
+    for (key, value) in &startup.parameters {
+        if key != "database" && key != "user" {
+            trace!(%database, %user, param = %key, %value, "ignoring client startup parameter");
+        }
+    }
+
     // Record the client's identity on both the registry entry and the
     // enclosing `proxy.client` span now that it's known.
     client_guard.set_database_and_user(&database, &user);
@@ -147,21 +157,23 @@ async fn forward_inner(
     // the initial checkout appear as a single trace without orphaned children.
     let mut guard = async {
         let result: anyhow::Result<_> = async {
-            // Resolve the admin connection address via topology (primary) and
-            // look up its password from pgpass. The admin credential must
-            // match the same (host, port, database, user) tuple the auth
-            // query connection will actually present — if an operator
-            // overrides `cluster.admin_database`, the matching `.pgpass`
-            // line must use that same database name or the lookup misses.
-            let admin_addr = pools
-                .resolve(&database, Routing::Primary)
-                .context("resolve admin connection target")?;
-            let admin_password = config.find_pool(&database).and_then(|(_, cluster, _)| {
-                pools
-                    .pgpass()
-                    .lookup_addr(&admin_addr, &cluster.admin_database, &cluster.admin_user)
-                    .map(str::to_owned)
-            });
+            let (_, cluster, _) = config
+                .find_pool(&database)
+                .ok_or_else(|| anyhow::anyhow!("database {database:?} not configured"))?;
+            let admin_addr = pools.resolve(&database, Routing::Primary)?;
+            let admin_password = pools
+                .pgpass()
+                .lookup_addr(&admin_addr, &cluster.admin_database, &cluster.admin_user)
+                .map(str::to_owned);
+            if admin_password.is_none() {
+                trace!(
+                    %database,
+                    admin_user = %cluster.admin_user,
+                    admin_database = %cluster.admin_database,
+                    %admin_addr,
+                    "no .pgpass entry for admin connection (upstream may use trust auth)"
+                );
+            }
             auth.authenticate(
                 &mut client,
                 &database,
