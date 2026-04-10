@@ -28,9 +28,9 @@ jobs:
             os: ubuntu-latest
             cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-15
     env:
       ARCHIVE: halephant-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
 
