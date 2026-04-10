@@ -65,13 +65,6 @@ fn track_set_reset(msg: &proto::frontend::FrontendMessage, server: &mut ServerCo
         sql::Statement::Discard {
             target: sql::DiscardTarget::All,
         } => {
-            // DISCARD ALL expands to (among other things) DEALLOCATE
-            // ALL + RESET ALL, so the server drops every prepared
-            // statement and resets every GUC. Mirror both in the
-            // tracking so the next pool user doesn't hit "prepared
-            // statement does not exist" or receive redundant RESETs
-            // on checkin. DISCARD PLANS / SEQUENCES / TEMP don't
-            // touch these and fall into the wildcard arm.
             server.prepared.clear();
             server.dirty_vars.clear();
         }

@@ -132,9 +132,13 @@ fn seed_primary(topology: &TopologyManager, primary_addr: String) {
     );
 }
 
-/// Set up a pool manager backed by a mock primary. Returns (pools, mock).
+/// Set up a pool manager backed by a mock primary.
 fn setup_pool(mock: &MockPg) -> (Arc<PoolManager>, Arc<ArcSwap<Config>>) {
-    let config = Arc::new(ArcSwap::from_pointee(test_config(&mock.addr())));
+    setup_pool_with_config(test_config(&mock.addr()), mock)
+}
+
+fn setup_pool_with_config(cfg: Config, mock: &MockPg) -> (Arc<PoolManager>, Arc<ArcSwap<Config>>) {
+    let config = Arc::new(ArcSwap::from_pointee(cfg));
     let pgpass = Arc::new(halephant_core::auth::pgpass::Pgpass::parse(""));
     let topology = Arc::new(TopologyManager::new(
         Arc::clone(&config),
@@ -2016,5 +2020,267 @@ async fn deallocate_all_is_intercepted() {
 
     drop(client);
     let _ = handle.await;
+    mock.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Prepared statement lifecycle — LRU eviction, unnamed reuse, disconnect
+// ---------------------------------------------------------------------------
+
+/// Helper: send Parse + Bind + Execute + Sync and drain until ReadyForQuery.
+async fn extended_query(client: &mut Framed<TcpStream, BackendCodec>, name: &str, query: &str) {
+    client
+        .send(FrontendMessage::Parse(
+            halephant_core::proto::frontend::Parse {
+                name: name.into(),
+                query: query.into(),
+                param_types: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .send(FrontendMessage::Bind(
+            halephant_core::proto::frontend::Bind {
+                portal: String::new(),
+                statement: name.into(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .send(FrontendMessage::Execute(
+            halephant_core::proto::frontend::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+        ))
+        .await
+        .unwrap();
+    client.send(FrontendMessage::Sync).await.unwrap();
+
+    loop {
+        let msg = client.next().await.unwrap().unwrap();
+        if matches!(msg, BackendMessage::ReadyForQuery(_)) {
+            break;
+        }
+    }
+}
+
+/// When the per-server LRU cache is full, the oldest prepared statement
+/// is evicted with a Close before the new one is prepared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_lru_eviction_sends_close() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "{TEST_CHECKOUT_TIMEOUT}"
+        max_prepared_statements = 2
+
+        [cluster.test]
+        nodes = ["{}"]
+
+        [cluster.test.pool.testdb.user.testuser]
+    "#,
+        mock.addr()
+    ))
+    .unwrap();
+    let (pools, _config) = setup_pool_with_config(cfg, &mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // Wrap all 3 Parses in a single explicit transaction so they hit
+    // the same server connection. Without BEGIN, each Parse is its
+    // own transaction and the pool may hand out a fresh connection
+    // (while the previous is still resetting), preventing the LRU
+    // from filling.
+    query_collect(&mut client, "BEGIN").await;
+    extended_query(&mut client, "s1", "SELECT 1").await;
+    extended_query(&mut client, "s2", "SELECT 2").await;
+    extended_query(&mut client, "s3", "SELECT 3").await;
+    query_collect(&mut client, "COMMIT").await;
+
+    let closes = mock.received_closes();
+    assert!(
+        !closes.is_empty(),
+        "expected at least one Close for LRU eviction, got none"
+    );
+
+    // All 3 canonical names should have been Parsed on the server.
+    let parses = mock.received_parses();
+    assert_eq!(
+        parses.len(),
+        3,
+        "expected 3 Parse messages on server, got {parses:?}"
+    );
+
+    drop(client);
+    let _ = handle.await;
+    mock.stop().await;
+}
+
+/// An unnamed Parse("") followed by Bind("") in a later transaction
+/// (different server checkout) re-prepares the statement transparently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unnamed_reuse_across_transactions() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // Transaction 1: Parse("") + Bind + Execute + Sync.
+    extended_query(&mut client, "", "SELECT 1").await;
+
+    // Transaction 2: only Bind("") + Execute + Sync (no new Parse).
+    // This is the lib/pq pattern that breaks without unnamed support.
+    client
+        .send(FrontendMessage::Bind(
+            halephant_core::proto::frontend::Bind {
+                portal: String::new(),
+                statement: String::new(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .send(FrontendMessage::Execute(
+            halephant_core::proto::frontend::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+        ))
+        .await
+        .unwrap();
+    client.send(FrontendMessage::Sync).await.unwrap();
+
+    let mut saw_complete = false;
+    loop {
+        let msg = client.next().await.unwrap().unwrap();
+        if matches!(msg, BackendMessage::CommandComplete(_)) {
+            saw_complete = true;
+        }
+        assert!(
+            !matches!(msg, BackendMessage::ErrorResponse(_)),
+            "Bind on unnamed in new transaction should not fail"
+        );
+        if matches!(msg, BackendMessage::ReadyForQuery(_)) {
+            break;
+        }
+    }
+    assert!(saw_complete, "expected CommandComplete from unnamed reuse");
+
+    drop(client);
+    let _ = handle.await;
+    mock.stop().await;
+}
+
+/// Replacing an unnamed Parse("") with a different query releases the
+/// old canonical and the new one is used for subsequent Bind("").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unnamed_replacement_releases_old_canonical() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    extended_query(&mut client, "", "SELECT 1").await;
+    extended_query(&mut client, "", "SELECT 2").await;
+
+    let parses = mock.received_parses();
+    assert_eq!(parses.len(), 2, "expected 2 Parse messages: {parses:?}");
+    assert_ne!(parses[0], parses[1], "canonical names should differ");
+
+    // Bind("") in a new transaction should use the second canonical.
+    client
+        .send(FrontendMessage::Bind(
+            halephant_core::proto::frontend::Bind {
+                portal: String::new(),
+                statement: String::new(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .send(FrontendMessage::Execute(
+            halephant_core::proto::frontend::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+        ))
+        .await
+        .unwrap();
+    client.send(FrontendMessage::Sync).await.unwrap();
+
+    loop {
+        let msg = client.next().await.unwrap().unwrap();
+        assert!(
+            !matches!(msg, BackendMessage::ErrorResponse(_)),
+            "Bind on replaced unnamed should succeed"
+        );
+        if matches!(msg, BackendMessage::ReadyForQuery(_)) {
+            break;
+        }
+    }
+
+    // The re-prepare should use the second canonical, not the first.
+    let all_parses = mock.received_parses();
+    let last_parse = all_parses.last().unwrap();
+    assert_eq!(last_parse, &parses[1]);
+
+    drop(client);
+    let _ = handle.await;
+    mock.stop().await;
+}
+
+/// When a client disconnects, `PreparedGuard::drop` releases all
+/// refcounts. With a single client, the store should be empty after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disconnect_releases_all_prepared() {
+    use halephant_core::proxy::prepared::canonical_for_test;
+
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    extended_query(&mut client, "s1", "SELECT 1").await;
+    extended_query(&mut client, "s2", "SELECT 2").await;
+    extended_query(&mut client, "", "SELECT 3").await;
+
+    // Store should have entries while the client is alive.
+    let c1 = canonical_for_test("SELECT 1", &[]);
+    let c2 = canonical_for_test("SELECT 2", &[]);
+    let c3 = canonical_for_test("SELECT 3", &[]);
+    assert!(pools.has_prepared(&c1), "SELECT 1 should be in store");
+    assert!(pools.has_prepared(&c2), "SELECT 2 should be in store");
+    assert!(pools.has_prepared(&c3), "SELECT 3 should be in store");
+
+    // Drop the client — triggers PreparedGuard::drop → release_all.
+    drop(client);
+    let _ = handle.await;
+
+    // All refcounts should be zero — entries removed.
+    assert!(!pools.has_prepared(&c1), "SELECT 1 should be released");
+    assert!(!pools.has_prepared(&c2), "SELECT 2 should be released");
+    assert!(!pools.has_prepared(&c3), "SELECT 3 should be released");
+
     mock.stop().await;
 }

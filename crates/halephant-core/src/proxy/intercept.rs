@@ -27,7 +27,6 @@ pub(super) async fn handle_close_intercept(
 ) -> anyhow::Result<Option<bool>> {
     if let proto::frontend::FrontendMessage::Close(close) = msg
         && close.kind == proto::frontend::TargetKind::Statement
-        && !close.name.is_empty()
     {
         {
             let mut store = pools.stmt_store.lock();

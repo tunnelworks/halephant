@@ -82,6 +82,12 @@ impl PoolManager {
         &self.config
     }
 
+    /// Check whether a canonical statement exists in the global store.
+    #[doc(hidden)]
+    pub fn has_prepared(&self, canon: &str) -> bool {
+        self.stmt_store.lock().get(canon).is_some()
+    }
+
     /// Access the pgpass store.
     pub fn pgpass(&self) -> &Pgpass {
         &self.pgpass

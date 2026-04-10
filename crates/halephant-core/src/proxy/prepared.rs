@@ -37,6 +37,13 @@ use crate::proto::frontend::Parse;
 // Canonical name generation
 // ---------------------------------------------------------------------------
 
+/// Compute the canonical name for a query. Exposed for integration
+/// tests that need to predict canonical names.
+#[doc(hidden)]
+pub fn canonical_for_test(query: &str, param_types: &[u32]) -> String {
+    canonical_name(query, param_types)
+}
+
 /// Compute a canonical statement name from the query text and parameter types.
 /// Identical queries produce the same canonical name, enabling deduplication
 /// across clients.
@@ -64,7 +71,7 @@ fn canonical_name(query: &str, param_types: &[u32]) -> String {
 /// Tracks the client-side → canonical name mapping for a single client session.
 #[derive(Default)]
 pub struct ClientPrepared {
-    /// client statement name → canonical name
+    /// client statement name → canonical name (includes `""` for unnamed)
     names: HashMap<String, String>,
 }
 
@@ -74,25 +81,31 @@ impl ClientPrepared {
     }
 
     /// Register a client-side name for a Parse, returning the canonical name.
+    /// Works for both named and unnamed (`""`) statements — unnamed
+    /// entries are tracked the same way so `Bind("")` in a subsequent
+    /// transaction resolves to the canonical name and gets re-prepared
+    /// on a fresh server connection automatically.
     pub fn register(&mut self, parse: &Parse, store: &mut StatementStore) -> String {
         let canon = canonical_name(&parse.query, &parse.param_types);
-        store.add_ref(canon.clone(), parse.clone());
-        if !parse.name.is_empty()
-            && let Some(old_canon) = self.names.insert(parse.name.clone(), canon.clone())
-            && old_canon != canon
-        {
-            store.release(&old_canon);
+        match self.names.insert(parse.name.clone(), canon.clone()) {
+            Some(ref old_canon) if old_canon == &canon => {
+                // Same canonical — no ref-count change needed.
+            }
+            Some(old_canon) => {
+                store.add_ref(canon.clone(), parse.clone());
+                store.release(&old_canon);
+            }
+            None => {
+                store.add_ref(canon.clone(), parse.clone());
+            }
         }
         canon
     }
 
-    /// Look up the canonical name for a client-side statement name. Returns
-    /// `None` for unnamed statements (the empty string), which are always
-    /// forwarded as-is.
+    /// Look up the canonical name for a client-side statement name.
+    /// Returns `None` if the name isn't tracked (first use, or the
+    /// client never sent a `Parse` for it).
     pub fn resolve(&self, client_name: &str) -> Option<&str> {
-        if client_name.is_empty() {
-            return None;
-        }
         self.names.get(client_name).map(String::as_str)
     }
 
@@ -131,20 +144,11 @@ pub(super) async fn rewrite_outbound(
 ) -> anyhow::Result<Option<proto::frontend::FrontendMessage>> {
     match msg {
         proto::frontend::FrontendMessage::Parse(parse) => {
-            if parse.name.is_empty() {
-                // Unnamed (anonymous) prepared statements are not cached — forward as-is.
-                return Ok(Some(proto::frontend::FrontendMessage::Parse(parse)));
-            }
-
             let canon = {
                 let mut store = pools.stmt_store.lock();
                 client_prepared.register(&parse, &mut store)
             };
 
-            // Ensure the server has this statement. If it was already there or
-            // was just prepared, do NOT forward the Parse again — PostgreSQL
-            // rejects duplicate named statements. Send a synthetic ParseComplete
-            // to the client instead.
             ensure_prepared(&canon, server, pools).await?;
             client
                 .send(proto::backend::BackendMessage::ParseComplete)
@@ -170,9 +174,8 @@ pub(super) async fn rewrite_outbound(
             Ok(Some(proto::frontend::FrontendMessage::Describe(desc)))
         }
 
-        // Close for named statements is handled by handle_close_intercept
-        // before reaching here. If one slips through (for portals or unnamed),
-        // forward as-is.
+        // Statement Close is handled by handle_close_intercept before
+        // reaching here. Portal closes pass through as-is.
         other => Ok(Some(other)),
     }
 }
@@ -297,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn client_unnamed_not_tracked() {
+    fn client_unnamed_tracked() {
         let mut store = StatementStore::new();
         let mut client = ClientPrepared::new();
 
@@ -307,8 +310,60 @@ mod tests {
             param_types: vec![],
         };
 
+        let canon = client.register(&parse, &mut store);
+        assert_eq!(client.resolve(""), Some(canon.as_str()));
+        assert!(store.get(&canon).is_some());
+    }
+
+    #[test]
+    fn client_unnamed_replaced_by_new_parse() {
+        let mut store = StatementStore::new();
+        let mut client = ClientPrepared::new();
+
+        let parse1 = Parse {
+            name: String::new(),
+            query: "SELECT 1".into(),
+            param_types: vec![],
+        };
+        let parse2 = Parse {
+            name: String::new(),
+            query: "SELECT 2".into(),
+            param_types: vec![],
+        };
+
+        let canon1 = client.register(&parse1, &mut store);
+        let canon2 = client.register(&parse2, &mut store);
+        assert_ne!(canon1, canon2);
+
+        // The unnamed slot now points to the second query.
+        assert_eq!(client.resolve(""), Some(canon2.as_str()));
+        // First query's refcount dropped to zero — removed from store.
+        assert!(store.get(&canon1).is_none());
+        assert!(store.get(&canon2).is_some());
+    }
+
+    #[test]
+    fn reparse_same_query_does_not_leak_refcount() {
+        let mut store = StatementStore::new();
+        let mut client = ClientPrepared::new();
+
+        let parse = Parse {
+            name: String::new(),
+            query: "SELECT 1".into(),
+            param_types: vec![],
+        };
+
+        let canon = client.register(&parse, &mut store);
+        // Re-register the exact same query — refcount must stay at 1.
         client.register(&parse, &mut store);
-        assert_eq!(client.resolve(""), None);
+        client.register(&parse, &mut store);
+
+        // release_all releases one ref — should reach zero.
+        client.release_all(&mut store);
+        assert!(
+            store.get(&canon).is_none(),
+            "store entry should be gone after release_all, but refcount leaked"
+        );
     }
 
     #[test]

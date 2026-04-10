@@ -27,11 +27,12 @@ pub(crate) struct MockPg {
     shutdown: Arc<Notify>,
     handle: tokio::task::JoinHandle<()>,
     connection_count: Arc<AtomicU32>,
-    /// Simple-query protocol strings the mock has received since it
-    /// started. Tests use this to assert interception — e.g., a
-    /// DEALLOCATE intercepted by halephant's transaction layer must
-    /// never show up here.
+    /// Simple-query protocol strings the mock has received.
     received_queries: Arc<Mutex<Vec<String>>>,
+    /// Statement names from Parse messages the mock has received.
+    received_parses: Arc<Mutex<Vec<String>>>,
+    /// Statement names from Close messages the mock has received.
+    received_closes: Arc<Mutex<Vec<String>>>,
 }
 
 /// Controls how the mock responds to queries.
@@ -101,7 +102,11 @@ impl MockPg {
         let connection_count = Arc::new(AtomicU32::new(0));
         let count = Arc::clone(&connection_count);
         let received_queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let received_for_task = Arc::clone(&received_queries);
+        let received_parses: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_closes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let queries_for_task = Arc::clone(&received_queries);
+        let parses_for_task = Arc::clone(&received_parses);
+        let closes_for_task = Arc::clone(&received_closes);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -111,10 +116,11 @@ impl MockPg {
                         stream.set_nodelay(true).unwrap();
                         count.fetch_add(1, Ordering::Relaxed);
                         let behavior = behavior.clone();
-                        let received = Arc::clone(&received_for_task);
+                        let queries = Arc::clone(&queries_for_task);
+                        let parses = Arc::clone(&parses_for_task);
+                        let closes = Arc::clone(&closes_for_task);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, behavior, is_replica, received).await {
-                                // Connection errors are expected in some tests.
+                            if let Err(e) = handle_connection(stream, behavior, is_replica, queries, parses, closes).await {
                                 let _ = e;
                             }
                         });
@@ -130,6 +136,8 @@ impl MockPg {
             handle,
             connection_count,
             received_queries,
+            received_parses,
+            received_closes,
         }
     }
 
@@ -145,9 +153,19 @@ impl MockPg {
     /// received across all connections since it started. Ordered by
     /// receipt time (within a single connection; concurrent
     /// connections may interleave).
-    #[allow(dead_code)] // only used by the DEALLOCATE intercept test today
+    #[allow(dead_code)]
     pub(crate) fn received_queries(&self) -> Vec<String> {
         self.received_queries.lock().clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn received_parses(&self) -> Vec<String> {
+        self.received_parses.lock().clone()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn received_closes(&self) -> Vec<String> {
+        self.received_closes.lock().clone()
     }
 
     pub(crate) async fn stop(self) {
@@ -161,6 +179,8 @@ async fn handle_connection(
     behavior: MockBehavior,
     is_replica: bool,
     received_queries: Arc<Mutex<Vec<String>>>,
+    received_parses: Arc<Mutex<Vec<String>>>,
+    received_closes: Arc<Mutex<Vec<String>>>,
 ) -> anyhow::Result<()> {
     let mut conn = Framed::new(stream, FrontendCodec::new());
 
@@ -284,7 +304,8 @@ async fn handle_connection(
                 }
             }
 
-            FrontendMessage::Parse(_) => {
+            FrontendMessage::Parse(ref parse) => {
+                received_parses.lock().push(parse.name.clone());
                 conn.send(BackendMessage::ParseComplete).await?;
             }
             FrontendMessage::Bind(_) => {
@@ -306,7 +327,8 @@ async fn handle_connection(
                 };
                 conn.send(BackendMessage::ReadyForQuery(status)).await?;
             }
-            FrontendMessage::Close(_) => {
+            FrontendMessage::Close(ref close) => {
+                received_closes.lock().push(close.name.clone());
                 conn.send(BackendMessage::CloseComplete).await?;
             }
             _ => {}
