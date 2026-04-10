@@ -7,15 +7,6 @@
 Disable SSL and server-side cursors. Server-side cursors use `DECLARE ... CURSOR`, which holds state across
 statements — incompatible with transaction-mode pooling where the server connection may change between statements.
 
-Do NOT set `options` (such as `-c search_path=...`) in `OPTIONS` — halephant does not forward client startup
-parameters to the upstream because server connections are shared in transaction mode. Configure `search_path` and
-other GUCs in the halephant TOML instead:
-
-```toml [halephant.toml]
-[cluster.main.pool.myapp.user.myapp.parameters]
-options = { search_path = "myschema,public" }
-```
-
 ```python [settings.py]
 DATABASES = {
     "default": {

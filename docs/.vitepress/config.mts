@@ -46,6 +46,7 @@ export default defineConfig({
           { text: "Backpressure and queueing", link: "/guide/backpressure" },
           { text: "LISTEN/NOTIFY", link: "/guide/listen-notify" },
           { text: "OpenTelemetry", link: "/guide/otel" },
+          { text: "Special cases", link: "/guide/special-cases" },
         ],
       },
       {
@@ -64,30 +65,22 @@ export default defineConfig({
           {
             text: "Ruby",
             collapsed: true,
-            items: [
-              { text: "Rails", link: "/clients/ruby/rails" },
-            ],
+            items: [{ text: "Rails", link: "/clients/ruby/rails" }],
           },
           {
             text: "PHP",
             collapsed: true,
-            items: [
-              { text: "Laravel", link: "/clients/php/laravel" },
-            ],
+            items: [{ text: "Laravel", link: "/clients/php/laravel" }],
           },
           {
             text: "Java",
             collapsed: true,
-            items: [
-              { text: "JDBC", link: "/clients/java/jdbc" },
-            ],
+            items: [{ text: "JDBC", link: "/clients/java/jdbc" }],
           },
           {
             text: "Go",
             collapsed: true,
-            items: [
-              { text: "pgx", link: "/clients/go/pgx" },
-            ],
+            items: [{ text: "pgx", link: "/clients/go/pgx" }],
           },
           {
             text: "Rust",
