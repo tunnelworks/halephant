@@ -82,7 +82,7 @@ opentelemetry-appender-tracing = { version = "0.31", default-features = false }
 tracing-opentelemetry = "0.32"
 
 # Internal crates
-halephant-core = { version = "*", path = "crates/halephant-core" }
+halephant-core = { version = "0.1", path = "crates/halephant-core" }
 
 
 [workspace.lints.rust]
