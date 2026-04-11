@@ -2284,3 +2284,237 @@ async fn client_disconnect_releases_all_prepared() {
 
     mock.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Connection limit enforcement — user-level and pool-level
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_max_connections_enforced() {
+    // Pool allows 10 primary connections, but userA is capped at 2.
+    // The 3rd checkout for userA must time out.
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "{TEST_CHECKOUT_TIMEOUT}"
+
+        [cluster.test]
+        nodes = ["{}"]
+
+        [cluster.test.pool.testdb]
+        max_connections = {{ primary = 10 }}
+
+        [cluster.test.pool.testdb.user.userA]
+        max_connections = {{ primary = 2 }}
+
+        [cluster.test.pool.testdb.user.userB]
+    "#,
+        mock.addr()
+    ))
+    .unwrap();
+    let (pools, _config) = setup_pool_with_config(cfg, &mock);
+
+    // userA: first 2 checkouts succeed.
+    let client_a = test_client_guard();
+    let g1 = pools
+        .checkout(&client_a, "testdb", "userA", false)
+        .await
+        .expect("userA checkout 1");
+    let g2 = pools
+        .checkout(&client_a, "testdb", "userA", false)
+        .await
+        .expect("userA checkout 2");
+
+    // userA: 3rd checkout hits the per-user limit.
+    let err = pools.checkout(&client_a, "testdb", "userA", false).await;
+    assert!(
+        err.is_err(),
+        "userA checkout 3 should fail (per-user max = 2)"
+    );
+
+    // userB: still has room under the pool-level limit.
+    let client_b = test_client_guard();
+    let g3 = pools
+        .checkout(&client_b, "testdb", "userB", false)
+        .await
+        .expect("userB should succeed despite userA being full");
+
+    drop((g1, g2, g3));
+    mock.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pool_max_connections_aggregate_across_users() {
+    // Pool allows 3 primary connections total. Two users with no
+    // per-user limit. The 4th checkout (any user) must time out.
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "{TEST_CHECKOUT_TIMEOUT}"
+
+        [cluster.test]
+        nodes = ["{}"]
+
+        [cluster.test.pool.testdb]
+        max_connections = {{ primary = 3 }}
+
+        [cluster.test.pool.testdb.user.userA]
+        [cluster.test.pool.testdb.user.userB]
+    "#,
+        mock.addr()
+    ))
+    .unwrap();
+    let (pools, _config) = setup_pool_with_config(cfg, &mock);
+
+    let client = test_client_guard();
+    let g1 = pools
+        .checkout(&client, "testdb", "userA", false)
+        .await
+        .expect("checkout 1");
+    let g2 = pools
+        .checkout(&client, "testdb", "userB", false)
+        .await
+        .expect("checkout 2");
+    let g3 = pools
+        .checkout(&client, "testdb", "userA", false)
+        .await
+        .expect("checkout 3");
+
+    // 4th checkout: pool aggregate is 3/3 — should time out.
+    let err = pools.checkout(&client, "testdb", "userB", false).await;
+    assert!(
+        err.is_err(),
+        "checkout 4 should fail (pool max = 3, 3 already active)"
+    );
+
+    drop((g1, g2, g3));
+    mock.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_limit_within_pool_limit() {
+    // Pool allows 4, userA allows 1, userB allows 3.
+    // userA gets 1, userB gets 3, total = 4 = pool max.
+    // An extra checkout for either user fails.
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "{TEST_CHECKOUT_TIMEOUT}"
+
+        [cluster.test]
+        nodes = ["{}"]
+
+        [cluster.test.pool.testdb]
+        max_connections = {{ primary = 4 }}
+
+        [cluster.test.pool.testdb.user.userA]
+        max_connections = {{ primary = 1 }}
+
+        [cluster.test.pool.testdb.user.userB]
+        max_connections = {{ primary = 3 }}
+    "#,
+        mock.addr()
+    ))
+    .unwrap();
+    let (pools, _config) = setup_pool_with_config(cfg, &mock);
+
+    let client = test_client_guard();
+    let ga = pools
+        .checkout(&client, "testdb", "userA", false)
+        .await
+        .expect("userA checkout 1");
+
+    // userA is at its per-user cap.
+    let err_a = pools.checkout(&client, "testdb", "userA", false).await;
+    assert!(
+        err_a.is_err(),
+        "userA checkout 2 should fail (user max = 1)"
+    );
+
+    // userB can still get 3.
+    let gb1 = pools
+        .checkout(&client, "testdb", "userB", false)
+        .await
+        .expect("userB checkout 1");
+    let gb2 = pools
+        .checkout(&client, "testdb", "userB", false)
+        .await
+        .expect("userB checkout 2");
+    let gb3 = pools
+        .checkout(&client, "testdb", "userB", false)
+        .await
+        .expect("userB checkout 3");
+
+    // Pool aggregate is now 4/4. userB's 4th hits the pool limit.
+    let err_b = pools.checkout(&client, "testdb", "userB", false).await;
+    assert!(
+        err_b.is_err(),
+        "userB checkout 4 should fail (pool max = 4, all used)"
+    );
+
+    drop((ga, gb1, gb2, gb3));
+    mock.stop().await;
+}
+
+/// When userA holds the last pool-level slot and userB is queued,
+/// checkin of userA's connection must wake userB — not just userA's
+/// (empty) queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_user_wake_on_pool_level_checkin() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "2s"
+
+        [cluster.test]
+        nodes = ["{}"]
+
+        [cluster.test.pool.testdb]
+        max_connections = {{ primary = 1 }}
+
+        [cluster.test.pool.testdb.user.userA]
+        [cluster.test.pool.testdb.user.userB]
+    "#,
+        mock.addr()
+    ))
+    .unwrap();
+    let (pools, _config) = setup_pool_with_config(cfg, &mock);
+
+    // userA takes the single slot.
+    let client_a = test_client_guard();
+    let guard_a = pools
+        .checkout(&client_a, "testdb", "userA", false)
+        .await
+        .expect("userA checkout should succeed");
+
+    // userB's checkout blocks (pool is full).
+    let pools2 = Arc::clone(&pools);
+    let userb_handle = tokio::spawn(async move {
+        let client_b = test_client_guard();
+        pools2.checkout(&client_b, "testdb", "userB", false).await
+    });
+
+    // Brief yield so userB's checkout enqueues.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Return userA's connection — this must wake userB.
+    guard_a.checkin();
+
+    // userB should succeed well within the 2s timeout.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), userb_handle)
+        .await
+        .expect("userB should be woken within 1s")
+        .expect("task should not panic");
+
+    assert!(
+        result.is_ok(),
+        "userB checkout should succeed after userA checkin, got: {:?}",
+        result.err()
+    );
+
+    mock.stop().await;
+}

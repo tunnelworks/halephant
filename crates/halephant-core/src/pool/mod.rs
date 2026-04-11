@@ -175,14 +175,9 @@ impl PoolManager {
         if drained > 0 {
             debug!(node, drained, "drained idle connections for node");
         }
-        // Topology has changed for this node (likely a role flip) —
-        // wake every waiter so they re-run `candidate_nodes` against
-        // the fresh topology. The waiter that was blocked on the old
-        // role's queue may now belong on the other queue entirely.
         self.wake_all_waiters();
     }
 
-    /// Close all idle connections across all pools. Called during shutdown.
     pub fn drain_all(&self) {
         let mut inner = self.inner.lock();
         let mut drained = 0u32;
@@ -209,40 +204,45 @@ impl PoolManager {
                         user: key.user.clone(),
                     },
                     o11y::metrics::PoolStats {
-                        active: pool.active,
+                        active: pool.active.len() as u32,
                         idle: pool.idle.len() as u32,
-                        resetting: pool.resetting,
+                        resetting: pool.resetting.len() as u32,
                     },
                 )
             })
             .collect()
     }
 
-    /// Returns a snapshot of every non-empty wait queue.
+    /// Returns a snapshot of every non-empty wait queue, broken down
+    /// per user within each `(database, role)` queue.
     #[must_use]
     pub fn queue_stats(&self) -> Vec<o11y::metrics::QueueInfo> {
         let now = Instant::now();
         let inner = self.inner.lock();
-        inner
-            .waits
-            .iter()
-            .filter_map(|(key, queue)| {
-                let depth = queue.waiters.len();
-                if depth == 0 {
-                    return None;
+        let mut result = Vec::new();
+        for (key, queue) in &inner.waits {
+            // Aggregate per-user within the shared queue.
+            let mut per_user: HashMap<&str, (u32, Instant)> = HashMap::new();
+            for waiter in &queue.waiters {
+                let entry = per_user
+                    .entry(&waiter.user)
+                    .or_insert((0, waiter.enqueued_at));
+                entry.0 += 1;
+                if waiter.enqueued_at < entry.1 {
+                    entry.1 = waiter.enqueued_at;
                 }
-                let oldest = queue.waiters.front().map_or(0.0, |(enqueued_at, _)| {
-                    now.saturating_duration_since(*enqueued_at).as_secs_f64()
-                });
-                Some(o11y::metrics::QueueInfo {
+            }
+            for (user, (depth, oldest)) in per_user {
+                result.push(o11y::metrics::QueueInfo {
                     database: key.database.clone(),
-                    user: key.user.clone(),
+                    user: user.to_owned(),
                     role: key.role,
-                    depth: depth as u32,
-                    oldest_wait_secs: oldest,
-                })
-            })
-            .collect()
+                    depth,
+                    oldest_wait_secs: now.saturating_duration_since(oldest).as_secs_f64(),
+                });
+            }
+        }
+        result
     }
 
     /// Returns the configured connection limits for each pool.

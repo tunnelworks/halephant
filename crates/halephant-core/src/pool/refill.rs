@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::{Instrument, debug, trace, warn};
+use tracing::{Instrument, debug, warn};
 
 use crate::connections::reset::reset_connection;
 use crate::connections::server::{self, ServerConn};
 use crate::pool::PoolManager;
-use crate::pool::types::{IdleConn, Pool, PoolKey};
+use crate::pool::types::{ConnId, IdleConn, PoolKey};
 
 /// Maximum in-flight connection opens per call to
 /// [`PoolManager::spawn_connections`]. Because PostgreSQL's postmaster
@@ -61,51 +61,61 @@ impl PoolManager {
     /// can drive it directly without spinning up the full background task.
     pub fn scavenge_idle(&self) -> u32 {
         let cfg = self.config.load_full();
-        let mut inner = self.inner.lock();
+        let mut freed: Vec<(PoolKey, u32)> = Vec::new();
         let mut removed = 0u32;
 
-        for (key, pool) in &mut inner.pools {
-            let pool_config = cfg.find_pool(&key.database).map(|(_, _, p)| p);
-            let idle_timeout =
-                pool_config.map_or(std::time::Duration::from_secs(300), |p| p.idle_timeout);
-            let max_lifetime =
-                pool_config.map_or(std::time::Duration::from_secs(3600), |p| p.max_lifetime);
+        {
+            let mut inner = self.inner.lock();
 
-            let before = pool.idle.len();
+            for (key, pool) in &mut inner.pools {
+                let pool_config = cfg.find_pool(&key.database).map(|(_, _, p)| p);
+                let idle_timeout =
+                    pool_config.map_or(std::time::Duration::from_secs(300), |p| p.idle_timeout);
+                let max_lifetime =
+                    pool_config.map_or(std::time::Duration::from_secs(3600), |p| p.max_lifetime);
 
-            // Step 1: always drop dead and over-lifetime connections.
-            pool.idle.retain(|idle| {
-                if idle.conn.created_at.elapsed() > max_lifetime {
-                    return false;
+                let before = pool.idle.len();
+
+                // Remove dead sockets and connections past max_lifetime
+                // unconditionally (regardless of min_connections floor).
+                pool.idle.retain(|idle| {
+                    idle.conn.created_at.elapsed() <= max_lifetime
+                        && crate::connections::sock::is_alive(idle.conn.framed.get_ref())
+                });
+
+                // Apply idle_timeout only to excess capacity above
+                // the min_connections floor.
+                let min_idle = self.min_for_key(&cfg, key) as usize;
+                let removable = pool.idle.len().saturating_sub(min_idle);
+                let mut dropped = 0usize;
+                pool.idle.retain(|idle| {
+                    if dropped >= removable {
+                        return true;
+                    }
+                    if idle.idle_since.elapsed() > idle_timeout {
+                        dropped += 1;
+                        return false;
+                    }
+                    true
+                });
+
+                let n = (before - pool.idle.len()) as u32;
+                if n > 0 {
+                    freed.push((key.clone(), n));
                 }
-                crate::connections::sock::is_alive(idle.conn.framed.get_ref())
-            });
+                removed += n;
+            }
 
-            // Step 2: apply idle_timeout, but stop once the pool is at the
-            // floor. The idle queue is FIFO, so the oldest expired connections
-            // are dropped first and the newest survive.
-            let min_idle = self.min_for_key(&cfg, key) as usize;
-            let removable = pool.idle.len().saturating_sub(min_idle);
-            let mut dropped = 0usize;
-            pool.idle.retain(|idle| {
-                if dropped >= removable {
-                    return true;
-                }
-                if idle.idle_since.elapsed() > idle_timeout {
-                    dropped += 1;
-                    return false;
-                }
-                true
-            });
-
-            removed += (before - pool.idle.len()) as u32;
+            inner.waits.retain(|_, q| !q.waiters.is_empty());
         }
 
-        // Prune empty wait-queue entries so short-lived
-        // `(database, user, role)` combinations that contended once
-        // and never came back don't accumulate in the map. This runs
-        // while the inner lock is already held for the scavenge pass.
-        inner.waits.retain(|_, q| !q.waiters.is_empty());
+        // Removing idle connections frees physical capacity — wake
+        // any waiter that was blocked on node-level limits.
+        for (key, n) in &freed {
+            for _ in 0..*n {
+                self.wake_one_for_node(key);
+            }
+        }
 
         removed
     }
@@ -135,7 +145,7 @@ impl PoolManager {
                             database: db_name.clone(),
                             user: user_name.clone(),
                         };
-                        let total = inner.pools.get(&key).map_or(0, Pool::total);
+                        let total = inner.pools.get(&key).map_or(0, |p| p.total() as u32);
                         let want = user_config.min_connections.primary;
                         if total < want {
                             result.push((key, want - total));
@@ -150,7 +160,7 @@ impl PoolManager {
                                 database: db_name.clone(),
                                 user: user_name.clone(),
                             };
-                            let total = inner.pools.get(&key).map_or(0, Pool::total);
+                            let total = inner.pools.get(&key).map_or(0, |p| p.total() as u32);
                             let want = user_config.min_connections.replica;
                             if total < want {
                                 result.push((key, want - total));
@@ -261,6 +271,7 @@ impl PoolManager {
                                 let mut inner = this.inner.lock();
                                 let pool = inner.pools.entry(key.clone()).or_default();
                                 pool.idle.push_back(IdleConn {
+                                    id: ConnId::next(),
                                     conn,
                                     idle_since: Instant::now(),
                                 });
@@ -337,10 +348,10 @@ impl PoolManager {
         }
     }
 
-    /// Reset a connection in the background and return it to the idle pool.
     pub(in crate::pool) async fn reset_and_return(
         self: &Arc<Self>,
         key: PoolKey,
+        id: ConnId,
         mut conn: ServerConn,
     ) {
         match reset_connection(&mut conn).await {
@@ -348,21 +359,14 @@ impl PoolManager {
                 let returned = {
                     let mut inner = self.inner.lock();
                     if let Some(pool) = inner.pools.get_mut(&key) {
-                        pool.resetting = pool.resetting.saturating_sub(1);
+                        pool.resetting.remove(&id);
                         pool.idle.push_back(IdleConn {
+                            id,
                             conn,
                             idle_since: Instant::now(),
                         });
-                        trace!(
-                            node = key.node,
-                            database = key.database,
-                            user = key.user,
-                            idle = pool.idle.len(),
-                            "connection reset and returned to pool"
-                        );
                         true
                     } else {
-                        // Pool entry gone — connection dropped.
                         false
                     }
                 };
@@ -381,12 +385,9 @@ impl PoolManager {
                 {
                     let mut inner = self.inner.lock();
                     if let Some(pool) = inner.pools.get_mut(&key) {
-                        pool.resetting = pool.resetting.saturating_sub(1);
+                        pool.resetting.remove(&id);
                     }
                 }
-                // The reset failed so the connection is gone — that
-                // frees a slot on the node, wake a waiter so it can
-                // try to grow the pool.
                 self.wake_one_for_node(&key);
             }
         }
