@@ -43,6 +43,10 @@ pub struct ServerConn {
     /// GUC variables SET by the client during this session. Only these are
     /// RESET during connection reset, preserving startup parameters.
     pub dirty_vars: HashSet<String>,
+    /// Last `ReadyForQuery` status seen on this connection. Updated by
+    /// the proxy forwarding loop so `reset_connection` knows whether a
+    /// `ROLLBACK` is needed. Starts as `Idle` (freshly connected).
+    pub last_tx_status: crate::proto::types::TransactionStatus,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +276,7 @@ pub(crate) async fn connect_server(
             created_at: Instant::now(),
             prepared: ServerPrepared::new(max_prepared),
             dirty_vars: HashSet::new(),
+            last_tx_status: crate::proto::types::TransactionStatus::Idle,
         })
     }
     .await

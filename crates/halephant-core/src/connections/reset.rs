@@ -22,19 +22,7 @@ use crate::proto::types::TransactionStatus;
 
 use super::server::ServerConn;
 
-/// Base reset commands that clean up non-GUC session state without
-/// destroying prepared statements or their cached plans.
-///
-/// Leads with `ROLLBACK;` so a connection handed back mid-transaction
-/// (e.g. the client sent `Terminate` inside a `BEGIN` block) is
-/// unwound before the rest of the reset runs — otherwise `CLOSE ALL`
-/// and friends would execute *inside* the orphaned transaction and
-/// the connection would return to the idle pool still in
-/// `InTransaction` state, leaking the previous client's uncommitted
-/// work into the next checkout. `ROLLBACK` outside a transaction
-/// block emits a harmless `NOTICE` and is otherwise a no-op.
 const BASE_RESET: &str = "\
-    ROLLBACK;\
     CLOSE ALL;\
     UNLISTEN *;\
     SELECT pg_advisory_unlock_all();\
@@ -54,7 +42,11 @@ pub(crate) async fn reset_connection(conn: &mut ServerConn) -> anyhow::Result<()
     async {
         let mut query = String::new();
 
-        // RESET only the variables the client explicitly SET.
+        // Only ROLLBACK if the connection is in a transaction
+        if conn.last_tx_status != TransactionStatus::Idle {
+            query.push_str("ROLLBACK;");
+        }
+
         for var in conn.dirty_vars.drain() {
             let _ = write!(query, "RESET {var};");
         }
@@ -71,14 +63,16 @@ pub(crate) async fn reset_connection(conn: &mut ServerConn) -> anyhow::Result<()
                 .transpose()
                 .context("reading reset response")?
             {
-                // Defence-in-depth against the orphaned-transaction
-                // bug the leading `ROLLBACK` guards against: if the
-                // reset returns to anything other than `Idle`, the
-                // connection is tainted and must not go back to the
-                // idle pool. Surfaces the failure as an error so
+                // Defence-in-depth against orphaned transactions:
+                // if the reset returns to anything other than `Idle`,
+                // the connection is tainted and must not go back to
+                // the idle pool. Surfaces the failure as an error so
                 // `reset_and_return` discards it instead of silently
                 // leaking transaction state to the next checkout.
-                Some(BackendMessage::ReadyForQuery(TransactionStatus::Idle)) => return Ok(()),
+                Some(BackendMessage::ReadyForQuery(TransactionStatus::Idle)) => {
+                    conn.last_tx_status = TransactionStatus::Idle;
+                    return Ok(());
+                }
                 Some(BackendMessage::ReadyForQuery(status)) => {
                     anyhow::bail!("reset left connection in non-idle state: {status:?}");
                 }

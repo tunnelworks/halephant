@@ -403,6 +403,7 @@ async fn forward_until_idle(
             msg = server.framed.next() => match msg.transpose()? {
                 Some(proto::backend::BackendMessage::ReadyForQuery(status)) => {
                     last_server_status = status;
+                    server.last_tx_status = status;
                     tracker.drain();
                     client.send(proto::backend::BackendMessage::ReadyForQuery(status)).await?;
                     if status == proto::types::TransactionStatus::Idle && !*pinned {
