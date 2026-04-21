@@ -17,27 +17,35 @@ impl PoolManager {
     }
 
     /// Wake one waiter that can use capacity freed on this node.
+    /// Freed primary capacity benefits both write waiters and
+    /// read-only waiters (who fall back to the primary when replicas
+    /// are full). Freed replica capacity only benefits replica waiters.
     pub(in crate::pool) fn wake_one_for_node(&self, key: &PoolKey) {
         let cfg = self.config.load();
         let Some((cluster_name, _, _)) = cfg.find_pool(&key.database) else {
             return;
         };
-        let role = match self.role_for_node(cluster_name, &key.node) {
-            NodeRole::Primary => Routing::Primary,
-            NodeRole::Replica => Routing::Replica,
+        // Wake the freed node's own role first. Freed primary
+        // capacity also benefits read-only waiters (who fall back
+        // to the primary), so wake Replica second. Freed replica
+        // capacity only helps replica waiters.
+        let roles: &[Routing] = match self.role_for_node(cluster_name, &key.node) {
+            NodeRole::Primary => &[Routing::Primary, Routing::Replica],
+            NodeRole::Replica => &[Routing::Replica],
             NodeRole::Unknown => return,
         };
-        let wait_key = WaitKey {
-            database: key.database.clone(),
-            role,
-        };
         let mut inner = self.inner.lock();
-        let Some(queue) = inner.waits.get_mut(&wait_key) else {
-            return;
-        };
-        while let Some(waiter) = queue.waiters.pop_front() {
-            if waiter.tx.send(()).is_ok() {
-                return;
+        for &role in roles {
+            let wait_key = WaitKey {
+                database: key.database.clone(),
+                role,
+            };
+            if let Some(queue) = inner.waits.get_mut(&wait_key) {
+                while let Some(waiter) = queue.waiters.pop_front() {
+                    if waiter.tx.send(()).is_ok() {
+                        return;
+                    }
+                }
             }
         }
     }

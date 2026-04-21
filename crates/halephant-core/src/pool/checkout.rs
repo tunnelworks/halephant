@@ -87,8 +87,15 @@ impl PoolManager {
 
         async {
             loop {
+                // Build candidate lists: primary target first, then
+                // primary as fallback for read-only traffic.
                 let candidates = self.resolve_candidates(&cfg, database, user, routing);
-                if candidates.is_empty() {
+                let fallback = if routing == Routing::Replica {
+                    self.resolve_candidates(&cfg, database, user, Routing::Primary)
+                } else {
+                    Vec::new()
+                };
+                if candidates.is_empty() && fallback.is_empty() {
                     return Err(match routing {
                         Routing::Primary => ResolveError::NoPrimary {
                             cluster: cluster_name.clone(),
@@ -100,7 +107,19 @@ impl PoolManager {
                     .into());
                 }
 
-                match self.try_candidates(&cfg, &candidates, idle_timeout, max_lifetime) {
+                // Try preferred candidates, then fallback.
+                let mut got = CandidateResult::AllFull;
+                for batch in [&candidates, &fallback] {
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    got = self.try_candidates(&cfg, batch, idle_timeout, max_lifetime);
+                    if !matches!(got, CandidateResult::AllFull) {
+                        break;
+                    }
+                }
+
+                match got {
                     CandidateResult::GotIdle { key, conn } => {
                         record_checkout_success(
                             &key,
@@ -151,7 +170,8 @@ impl PoolManager {
                             }
                             Err(e) => {
                                 self.discard_internal(&key, id);
-                                if candidates.len() == 1 {
+                                let total = candidates.len() + fallback.len();
+                                if total == 1 {
                                     return Err(e);
                                 }
                             }

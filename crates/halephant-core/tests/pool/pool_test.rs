@@ -1129,11 +1129,10 @@ async fn scavenger_preserves_per_replica_floor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkout_per_node_max_with_two_replicas() {
+async fn read_only_falls_back_to_primary_when_replicas_full() {
     // max_connections.replica = 2 means 2 PER replica node. With 2
-    // replicas, the total replica capacity is 4 (round-robin distributes
-    // them as 2+2). The 5th read-only checkout must block on the wait
-    // queue and time out because every candidate node is full.
+    // replicas, total replica capacity is 4. The 5th read-only
+    // checkout falls back to the primary instead of timing out.
     let primary = MockPg::start(MockBehavior::Ok).await;
     let replica_a = MockPg::start_replica(MockBehavior::Ok).await;
     let replica_b = MockPg::start_replica(MockBehavior::Ok).await;
@@ -1171,7 +1170,7 @@ async fn checkout_per_node_max_with_two_replicas() {
 
     let client = test_client_guard();
 
-    // Four read-only checkouts: round-robin distributes as 2 per replica.
+    // Four read-only checkouts fill both replicas (2 each).
     let mut guards = Vec::new();
     for _ in 0..4 {
         let guard = pools
@@ -1181,21 +1180,19 @@ async fn checkout_per_node_max_with_two_replicas() {
         guards.push(guard);
     }
 
-    // Both replicas are at their per-node ceiling. The 5th checkout
-    // enqueues and times out because no capacity is freed within
-    // `TEST_CHECKOUT_TIMEOUT`.
-    let result = pools.checkout(&client, "testdb", "testuser", true).await;
-    assert!(
-        result.is_err(),
-        "5th read-only checkout should time out at the per-node max"
-    );
-    let err = result.err().unwrap().to_string();
-    assert!(
-        err.contains("timed out"),
-        "checkout timeout error expected, got: {err}"
+    // 5th read-only checkout falls back to the primary.
+    let guard5 = pools
+        .checkout(&client, "testdb", "testuser", true)
+        .await
+        .expect("5th read-only checkout should fall back to primary");
+    assert_eq!(
+        guard5.node(),
+        primary.addr(),
+        "fallback should route to the primary"
     );
 
     drop(guards);
+    drop(guard5);
     primary.stop().await;
     replica_a.stop().await;
     replica_b.stop().await;
@@ -2517,4 +2514,63 @@ async fn cross_user_wake_on_pool_level_checkin() {
     );
 
     mock.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_user_does_not_fall_back_to_primary() {
+    // A user with max_connections = { replica = 2 } (no primary) must
+    // NOT fall back to the primary — user_has_capacity returns false
+    // for the primary candidate.
+    let primary = MockPg::start(MockBehavior::Ok).await;
+    let replica = MockPg::start_replica(MockBehavior::Ok).await;
+    let toml = format!(
+        r#"
+        [server]
+        checkout_timeout = "{TEST_CHECKOUT_TIMEOUT}"
+
+        [cluster.test]
+        nodes = ["{}", "{}"]
+        admin_user = "testuser"
+
+        [cluster.test.pool.testdb]
+        max_connections = {{ primary = 10, replica = 2 }}
+
+        [cluster.test.pool.testdb.user.rouser]
+        max_connections = {{ replica = 2 }}
+    "#,
+        primary.addr(),
+        replica.addr(),
+    );
+
+    let config = Arc::new(ArcSwap::from_pointee(Config::parse(&toml).unwrap()));
+    let pgpass = Arc::new(halephant_core::auth::pgpass::Pgpass::parse(""));
+    let topology = Arc::new(TopologyManager::new(
+        Arc::clone(&config),
+        Arc::clone(&pgpass),
+    ));
+    seed_primary_with_replicas(&topology, primary.addr(), vec![replica.addr()]);
+    let pools = Arc::new(PoolManager::new(Arc::clone(&config), topology, pgpass));
+
+    let client = test_client_guard();
+
+    // Fill the replica (2 connections).
+    let g1 = pools
+        .checkout(&client, "testdb", "rouser", true)
+        .await
+        .expect("checkout 1");
+    let g2 = pools
+        .checkout(&client, "testdb", "rouser", true)
+        .await
+        .expect("checkout 2");
+
+    // 3rd checkout: replica full, primary budget is 0 — must time out.
+    let result = pools.checkout(&client, "testdb", "rouser", true).await;
+    assert!(
+        result.is_err(),
+        "read-only user should NOT fall back to primary"
+    );
+
+    drop((g1, g2));
+    primary.stop().await;
+    replica.stop().await;
 }
