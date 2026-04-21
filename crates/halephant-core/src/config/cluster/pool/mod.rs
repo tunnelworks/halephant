@@ -121,9 +121,9 @@ fn default_pool_max_connections() -> ConnectionLimits {
 }
 
 fn default_idle_timeout() -> Duration {
-    Duration::from_secs(300)
+    Duration::from_mins(5)
 }
 
 fn default_max_lifetime() -> Duration {
-    Duration::from_secs(3600)
+    Duration::from_hours(1)
 }

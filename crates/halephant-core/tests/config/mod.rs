@@ -42,14 +42,14 @@ fn defaults_applied() {
     let cluster = config.cluster.get("main").unwrap();
     assert_eq!(cluster.admin_user, "halephant");
     assert_eq!(cluster.connect_timeout, Duration::from_secs(5));
-    assert_eq!(cluster.auth.cache_ttl, Duration::from_secs(300));
+    assert_eq!(cluster.auth.cache_ttl, Duration::from_mins(5));
     assert_eq!(cluster.topology.interval, Duration::from_secs(5));
     assert_eq!(cluster.topology.timeout, Duration::from_secs(3));
 
     let pool = cluster.pool.get("mydb").unwrap();
     assert_eq!(pool.mode, cluster::pool::PoolMode::Transaction);
     assert_eq!(pool.max_connections.primary, 100);
-    assert_eq!(pool.idle_timeout, Duration::from_secs(300));
+    assert_eq!(pool.idle_timeout, Duration::from_mins(5));
 
     let alice = pool.user.get("alice").unwrap();
     assert_eq!(
@@ -120,14 +120,14 @@ fn parse_full() {
 
     assert_eq!(config.server.listen, vec!["0.0.0.0:5555", "[::]:5555"]);
     assert_eq!(config.server.workers, 4);
-    assert_eq!(config.server.shutdown_timeout, Duration::from_secs(60));
+    assert_eq!(config.server.shutdown_timeout, Duration::from_mins(1));
     assert_eq!(config.logging.format, logging::LogFormat::Text);
 
     let orders = config.cluster.get("orders").unwrap();
     assert_eq!(orders.nodes.len(), 3);
     assert_eq!(orders.admin_user, "admin");
     assert_eq!(orders.connect_timeout, Duration::from_secs(10));
-    assert_eq!(orders.auth.cache_ttl, Duration::from_secs(600));
+    assert_eq!(orders.auth.cache_ttl, Duration::from_mins(10));
     assert_eq!(orders.topology.interval, Duration::from_secs(10));
 
     let analytics = config.cluster.get("analytics").unwrap();

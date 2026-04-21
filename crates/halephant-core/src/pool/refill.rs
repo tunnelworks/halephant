@@ -70,9 +70,9 @@ impl PoolManager {
             for (key, pool) in &mut inner.pools {
                 let pool_config = cfg.find_pool(&key.database).map(|(_, _, p)| p);
                 let idle_timeout =
-                    pool_config.map_or(std::time::Duration::from_secs(300), |p| p.idle_timeout);
+                    pool_config.map_or(std::time::Duration::from_mins(5), |p| p.idle_timeout);
                 let max_lifetime =
-                    pool_config.map_or(std::time::Duration::from_secs(3600), |p| p.max_lifetime);
+                    pool_config.map_or(std::time::Duration::from_hours(1), |p| p.max_lifetime);
 
                 let before = pool.idle.len();
 

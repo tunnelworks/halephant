@@ -29,5 +29,5 @@ fn default_auth_query() -> String {
 }
 
 fn default_auth_cache_ttl() -> Duration {
-    Duration::from_secs(300)
+    Duration::from_mins(5)
 }
