@@ -115,16 +115,12 @@ fn double_quoted_ident<'src>() -> impl Parser<'src, &'src str, Token, E<'src>> +
             let mut name = String::new();
             loop {
                 match inp.next() {
-                    Some('"') => {
-                        if inp.peek() == Some('"') {
-                            inp.skip();
-                            name.push('"'); // escaped ""
-                        } else {
-                            return Ok(name); // end of identifier
-                        }
+                    Some('"') if inp.peek() == Some('"') => {
+                        inp.skip();
+                        name.push('"'); // escaped ""
                     }
+                    Some('"') | None => return Ok(name), // end of identifier (or unterminated)
                     Some(c) => name.push(c),
-                    None => return Ok(name), // unterminated — tolerate
                 }
             }
         }))
@@ -200,16 +196,12 @@ fn single_quoted_string<'src>() -> impl Parser<'src, &'src str, String, E<'src>>
         let mut content = String::new();
         loop {
             match inp.next() {
-                Some('\'') => {
-                    if inp.peek() == Some('\'') {
-                        inp.skip();
-                        content.push('\'');
-                    } else {
-                        return Ok(content.to_ascii_lowercase());
-                    }
+                Some('\'') if inp.peek() == Some('\'') => {
+                    inp.skip();
+                    content.push('\'');
                 }
+                Some('\'') | None => return Ok(content.to_ascii_lowercase()),
                 Some(c) => content.push(c),
-                None => return Ok(content.to_ascii_lowercase()),
             }
         }
     }))
