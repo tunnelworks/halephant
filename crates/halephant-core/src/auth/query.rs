@@ -348,5 +348,5 @@ async fn run_auth_query(
         errors::AuthError::VerifierFetch(format!("no password found for user {target_user:?}"))
     })?;
 
-    scram::ScramVerifier::parse(&raw)
+    scram::parse_verifier(&raw)
 }

@@ -15,11 +15,11 @@ use tokio::sync::Notify;
 use tokio_util::codec::Framed;
 
 use halephant_core::auth::scram::ScramVerifier;
-use halephant_core::auth::scram::server::ScramServer;
 use halephant_core::proto::backend::BackendMessage;
 use halephant_core::proto::codec::FrontendCodec;
 use halephant_core::proto::frontend::FrontendMessage;
 use halephant_core::proto::types::TransactionStatus;
+use tinyscram::ServerSession;
 
 /// A mock PostgreSQL server that accepts connections and responds to queries.
 pub(crate) struct MockPg {
@@ -357,8 +357,10 @@ async fn scram_server_auth(
     let (_mechanism, client_first) = parse_sasl_initial_response(&initial)?;
 
     // Process client-first, send server-first.
-    let mut server = ScramServer::new(verifier);
-    let server_first = server.handle_client_first(client_first)?;
+    let mut server = ServerSession::new(verifier);
+    let server_first = server
+        .handle_client_first(client_first)
+        .map_err(|e| anyhow::anyhow!("scram: {e}"))?;
     conn.send(BackendMessage::AuthenticationSaslContinue { data: server_first })
         .await?;
 
@@ -369,7 +371,9 @@ async fn scram_server_auth(
     };
 
     // Verify and send server-final.
-    let server_final = server.handle_client_final(&client_final)?;
+    let server_final = server
+        .handle_client_final(&client_final)
+        .map_err(|e| anyhow::anyhow!("scram: {e}"))?;
     conn.feed(BackendMessage::AuthenticationSaslFinal { data: server_final })
         .await?;
     conn.send(BackendMessage::AuthenticationOk).await?;

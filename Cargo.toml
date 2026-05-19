@@ -34,6 +34,7 @@ base64 = "0.22"
 rand = "0.9"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 subtle = "2"
+tinyscram = "0.1"
 
 # Error Handling
 thiserror = "2.0"
