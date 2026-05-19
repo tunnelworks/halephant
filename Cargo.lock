@@ -577,6 +577,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror",
+ "tinyscram",
  "tokio",
  "tokio-util",
  "toml",
@@ -1496,6 +1497,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tinyscram"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5971e5d5e73719a3e094607e3535482973e8405a364af55260ba7595277e4d45"
+dependencies = [
+ "base64",
+ "hmac",
+ "pbkdf2",
+ "rand",
+ "sha2",
+ "subtle",
 ]
 
 [[package]]
