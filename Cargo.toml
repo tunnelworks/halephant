@@ -51,7 +51,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 # System
-socket2 = "0.5"
+socket2 = "0.6"
 arc-swap = "1"
 tempfile = "3"
 parking_lot = "0.12"
