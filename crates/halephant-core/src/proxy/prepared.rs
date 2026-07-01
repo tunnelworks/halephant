@@ -10,10 +10,10 @@
 //! 2. Maintaining a per-client mapping from client-side names to
 //!    canonical names.
 //! 3. Tracking which canonical statements each server connection has
-//!    prepared. (The per-connection LRU cache lives on
-//!    [`crate::connections::server::ServerPrepared`] so it can travel
+//!    prepared. (Per-connection state lives on
+//!    [`crate::connections::server::PreparedStatements`] so it can travel
 //!    with the [`crate::connections::server::ServerConn`] it belongs
-//!    to.)
+//!    to, and decides which backend replies to filter.)
 //! 4. Transparently re-preparing statements on cache miss.
 //!
 //! The global, reference-counted store of Parse messages lives in
@@ -22,12 +22,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
-use crate::connections::server::ServerConn;
+use crate::connections::server::{ClientParse, Reprepare, ServerConn};
 use crate::pool::PoolManager;
 use crate::pool::prepared::StatementStore;
 use crate::proto;
@@ -126,6 +126,22 @@ impl ClientPrepared {
     }
 }
 
+/// RAII holder for a session's [`ClientPrepared`] that releases every
+/// statement-store reference on drop — including when the client task is
+/// cancelled mid-`await`, where an explicit cleanup after the forward
+/// loop would never run. Shared by both pool modes.
+pub(super) struct PreparedGuard {
+    pub(super) inner: ClientPrepared,
+    pub(super) pools: Arc<PoolManager>,
+}
+
+impl Drop for PreparedGuard {
+    fn drop(&mut self) {
+        let mut store = self.pools.stmt_store.lock();
+        self.inner.release_all(&mut store);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outbound rewriting + server-side preparation
 // ---------------------------------------------------------------------------
@@ -149,11 +165,30 @@ pub(super) async fn rewrite_outbound(
                 client_prepared.register(&parse, &mut store)
             };
 
-            ensure_prepared(&canon, server, pools).await?;
-            client
-                .send(proto::backend::BackendMessage::ParseComplete)
-                .await?;
-            Ok(None)
+            match server.statements.note_client_parse(&canon) {
+                ClientParse::Synthesize => {
+                    // Already prepared on this backend — either the client
+                    // re-Parsed a query it already sent, or another client
+                    // prepared the same canonical first. Re-Parsing the
+                    // canonical name would draw "prepared statement already
+                    // exists", so skip the backend round-trip and answer
+                    // synthetically.
+                    client
+                        .send(proto::backend::BackendMessage::ParseComplete)
+                        .await?;
+                    Ok(None)
+                }
+                ClientParse::Forward { eviction } => {
+                    // Not on this backend yet. Forward the Parse under its
+                    // canonical name so the backend's own ParseComplete
+                    // flows back in order — no synthetic reply, no
+                    // out-of-band Sync. Evict first if the cache was full.
+                    send_eviction(eviction, server).await?;
+                    let mut parse = parse;
+                    parse.name = canon;
+                    Ok(Some(proto::frontend::FrontendMessage::Parse(parse)))
+                }
+            }
         }
 
         proto::frontend::FrontendMessage::Bind(mut bind) => {
@@ -174,35 +209,73 @@ pub(super) async fn rewrite_outbound(
             Ok(Some(proto::frontend::FrontendMessage::Describe(desc)))
         }
 
-        // Statement Close is handled by handle_close_intercept before
-        // reaching here. Portal closes pass through as-is.
+        proto::frontend::FrontendMessage::Close(close) => {
+            // Statement closes are absorbed by `handle_close_intercept`
+            // before reaching here, so this is a portal close. Forward it
+            // and record that its `CloseComplete` belongs to the client —
+            // this keeps the `CloseComplete` FIFO aligned with any
+            // interleaved eviction closes.
+            server.statements.note_portal_close();
+            Ok(Some(proto::frontend::FrontendMessage::Close(close)))
+        }
+
         other => Ok(Some(other)),
     }
 }
 
-/// Ensure a canonical statement is prepared on the server connection. If the
-/// server doesn't have it, send the stored Parse and consume the ParseComplete.
+/// Ensure a canonical statement is prepared on the server connection.
+///
+/// On a cache miss the stored `Parse` is injected into the normal
+/// outbound stream — **without** a `Sync` and without draining the
+/// backend — and [`PreparedStatements`] records the disposition so the
+/// proxy strips the matching `ParseComplete`/`CloseComplete` from the
+/// client-facing stream. (The previous implementation injected a `Sync`
+/// and drained to `ReadyForQuery`, which discarded responses the backend
+/// had buffered for the client's own pipelined messages — corrupting the
+/// stream for drivers that batch statements.)
+///
+/// Used for `Bind`/`Describe`-triggered re-preparation, where the client
+/// never sent a `Parse`, so the injected `ParseComplete` is suppressed.
+///
+/// [`PreparedStatements`]: crate::connections::server::PreparedStatements
 async fn ensure_prepared(
     canon: &str,
     server: &mut ServerConn,
     pools: &Arc<PoolManager>,
 ) -> anyhow::Result<()> {
-    if server.prepared.contains(canon) {
-        server.prepared.touch(canon);
-        return Ok(());
+    match server.statements.note_reprepare(canon) {
+        Reprepare::AlreadyPrepared => Ok(()),
+        Reprepare::Prepare { eviction } => {
+            // Any canonical in `client_prepared` keeps its `Parse` in the
+            // store (the ref is held until release), so this lookup is
+            // effectively infallible. On the impossible miss we bail and
+            // the connection is discarded, so the optimistic insert
+            // `note_reprepare` just made never reaches the pool.
+            let stored_parse = {
+                let store = pools.stmt_store.lock();
+                store.get(canon).cloned()
+            };
+            let Some(mut parse) = stored_parse else {
+                anyhow::bail!("no stored Parse for canonical statement {canon}");
+            };
+            send_eviction(eviction, server).await?;
+            parse.name = canon.to_owned();
+            server
+                .framed
+                .send(proto::frontend::FrontendMessage::Parse(parse))
+                .await?;
+            Ok(())
+        }
     }
+}
 
-    // Look up the stored Parse first — bail if missing.
-    let stored_parse = {
-        let store = pools.stmt_store.lock();
-        store.get(canon).cloned()
-    };
-    let Some(mut parse) = stored_parse else {
-        anyhow::bail!("no stored Parse for canonical statement {canon}");
-    };
-
-    // Evict if necessary, then prepare.
-    if let Some(evicted) = server.prepared.insert(canon.to_owned()) {
+/// Send a statement `Close` for an LRU-evicted canonical, if any. Its
+/// `CloseComplete` is already queued for suppression by the
+/// [`PreparedStatements`] call that returned `eviction`.
+///
+/// [`PreparedStatements`]: crate::connections::server::PreparedStatements
+async fn send_eviction(eviction: Option<String>, server: &mut ServerConn) -> anyhow::Result<()> {
+    if let Some(evicted) = eviction {
         server
             .framed
             .send(proto::frontend::FrontendMessage::Close(
@@ -212,45 +285,8 @@ async fn ensure_prepared(
                 },
             ))
             .await?;
-        server
-            .framed
-            .send(proto::frontend::FrontendMessage::Sync)
-            .await?;
-        drain_until_ready(&mut server.framed).await?;
     }
-
-    parse.name = canon.to_owned();
-    server
-        .framed
-        .send(proto::frontend::FrontendMessage::Parse(parse))
-        .await?;
-    server
-        .framed
-        .send(proto::frontend::FrontendMessage::Sync)
-        .await?;
-    drain_until_ready(&mut server.framed).await?;
-
     Ok(())
-}
-
-/// Drain server responses until ReadyForQuery, discarding everything except
-/// errors (which are propagated).
-async fn drain_until_ready(
-    framed: &mut Framed<TcpStream, proto::codec::BackendCodec>,
-) -> anyhow::Result<()> {
-    loop {
-        match framed.next().await.transpose()? {
-            Some(proto::backend::BackendMessage::ReadyForQuery(_)) => return Ok(()),
-            Some(proto::backend::BackendMessage::ErrorResponse(err)) => {
-                anyhow::bail!(
-                    "server error during prepared statement management: {}",
-                    err.message().unwrap_or("unknown")
-                );
-            }
-            Some(_) => {} // ParseComplete, CloseComplete, etc.
-            None => anyhow::bail!("upstream closed during prepared statement management"),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

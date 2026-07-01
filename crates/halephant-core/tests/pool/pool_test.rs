@@ -671,8 +671,10 @@ async fn session_mode_forward() {
     }
 
     // Run session forwarding in background.
+    let pools_for_session = Arc::clone(&pools);
     let handle = tokio::spawn(async move {
-        halephant_core::proxy::session::forward(&mut proxy_client, guard.conn()).await
+        halephant_core::proxy::session::forward(&mut proxy_client, guard.conn(), &pools_for_session)
+            .await
     });
 
     // Send a query through the session.
@@ -2279,6 +2281,440 @@ async fn client_disconnect_releases_all_prepared() {
     assert!(!pools.has_prepared(&c2), "SELECT 2 should be released");
     assert!(!pools.has_prepared(&c3), "SELECT 3 should be released");
 
+    mock.stop().await;
+}
+
+/// Discriminant tag for asserting backend-message ordering without
+/// caring about message payloads.
+#[derive(Debug, PartialEq, Eq)]
+enum Tag {
+    Parse,
+    Bind,
+    Command,
+}
+
+/// A client that pipelines two extended-protocol statements in a single
+/// implicit transaction — `Parse`/`Bind`/`Execute` twice, then one
+/// trailing `Sync` — must receive every response for BOTH statements, in
+/// protocol order.
+///
+/// This is the shape that drivers such as sqlx emit when they batch
+/// statements. The transaction-mode proxy used to re-prepare statements
+/// by injecting an out-of-band `Sync` and draining the server up to
+/// `ReadyForQuery`, which silently swallowed the earlier statement's
+/// `BindComplete`/`CommandComplete` and reordered `ParseComplete`. The
+/// client then saw a desynchronized stream. This test pins the correct
+/// behavior so the regression cannot return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_statements_preserve_all_responses() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // Feed buffers without flushing; the trailing Sync flushes the whole
+    // batch at once so the proxy reads a genuinely pipelined stream.
+    for (name, query) in [("s1", "SELECT 1"), ("s2", "SELECT 2")] {
+        client
+            .feed(FrontendMessage::Parse(
+                halephant_core::proto::frontend::Parse {
+                    name: name.into(),
+                    query: query.into(),
+                    param_types: vec![],
+                },
+            ))
+            .await
+            .unwrap();
+        client
+            .feed(FrontendMessage::Bind(
+                halephant_core::proto::frontend::Bind {
+                    portal: String::new(),
+                    statement: name.into(),
+                    param_formats: vec![],
+                    params: vec![],
+                    result_formats: vec![],
+                },
+            ))
+            .await
+            .unwrap();
+        client
+            .feed(FrontendMessage::Execute(
+                halephant_core::proto::frontend::Execute {
+                    portal: String::new(),
+                    max_rows: 0,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    client.send(FrontendMessage::Sync).await.unwrap();
+
+    let mut msgs = Vec::new();
+    loop {
+        let m = client.next().await.unwrap().unwrap();
+        let done = matches!(m, BackendMessage::ReadyForQuery(_));
+        msgs.push(m);
+        if done {
+            break;
+        }
+    }
+
+    // Both statements' completions must arrive — none swallowed.
+    let count = |want: &Tag| {
+        msgs.iter()
+            .filter(|m| match m {
+                BackendMessage::ParseComplete => want == &Tag::Parse,
+                BackendMessage::BindComplete => want == &Tag::Bind,
+                BackendMessage::CommandComplete(_) => want == &Tag::Command,
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(
+        count(&Tag::Command),
+        2,
+        "both statements' CommandComplete must reach the client: {msgs:?}"
+    );
+    assert_eq!(
+        count(&Tag::Bind),
+        2,
+        "both statements' BindComplete must reach the client: {msgs:?}"
+    );
+    assert_eq!(
+        count(&Tag::Parse),
+        2,
+        "both statements' ParseComplete must reach the client: {msgs:?}"
+    );
+
+    // And in protocol order: each statement's Parse → Bind → Command,
+    // not the reordered/duplicated stream the swallow produced.
+    let order: Vec<Tag> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            BackendMessage::ParseComplete => Some(Tag::Parse),
+            BackendMessage::BindComplete => Some(Tag::Bind),
+            BackendMessage::CommandComplete(_) => Some(Tag::Command),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            Tag::Parse,
+            Tag::Bind,
+            Tag::Command,
+            Tag::Parse,
+            Tag::Bind,
+            Tag::Command
+        ],
+        "responses must be in per-statement protocol order: {msgs:?}"
+    );
+
+    drop(client);
+    let _ = handle.await;
+    mock.stop().await;
+}
+
+/// A transparent re-prepare (and the LRU eviction it may trigger) must
+/// be invisible to the client: the backend's `ParseComplete` for the
+/// injected `Parse` and its `CloseComplete` for the evicted statement
+/// are halephant's own traffic, not answers to anything the client sent.
+///
+/// Forces the path with `max_prepared_statements = 1`: preparing `s2`
+/// evicts `s1`, so a later `Bind` on `s1` (sent without a fresh `Parse`,
+/// the way a driver reuses a client-cached statement) makes halephant
+/// re-`Parse` `s1` and evict `s2`. The client's `Bind` step must see a
+/// clean `BindComplete` + `CommandComplete`, with no stray
+/// `ParseComplete` or `CloseComplete`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reprepare_and_eviction_replies_are_hidden_from_client() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "{TEST_CHECKOUT_TIMEOUT}"
+        max_prepared_statements = 1
+
+        [cluster.test]
+        nodes = ["{}"]
+
+        [cluster.test.pool.testdb.user.testuser]
+    "#,
+        mock.addr()
+    ))
+    .unwrap();
+    let (pools, _config) = setup_pool_with_config(cfg, &mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // Pin everything to one backend with an explicit transaction so the
+    // per-connection LRU actually fills and evicts.
+    query_collect(&mut client, "BEGIN").await;
+    extended_query(&mut client, "s1", "SELECT 1").await; // prepares _hp(s1)
+    extended_query(&mut client, "s2", "SELECT 2").await; // evicts _hp(s1), prepares _hp(s2)
+
+    // Reuse s1 with only Bind + Execute + Sync (no Parse) — s1 is no
+    // longer on the backend, so halephant must re-prepare it (injected
+    // Parse) and evict s2 (injected Close).
+    client
+        .feed(FrontendMessage::Bind(
+            halephant_core::proto::frontend::Bind {
+                portal: String::new(),
+                statement: "s1".into(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .feed(FrontendMessage::Execute(
+            halephant_core::proto::frontend::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+        ))
+        .await
+        .unwrap();
+    client.send(FrontendMessage::Sync).await.unwrap();
+
+    let mut msgs = Vec::new();
+    loop {
+        let m = client.next().await.unwrap().unwrap();
+        let done = matches!(m, BackendMessage::ReadyForQuery(_));
+        msgs.push(m);
+        if done {
+            break;
+        }
+    }
+
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, BackendMessage::BindComplete)),
+        "client should see BindComplete for its Bind: {msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, BackendMessage::CommandComplete(_))),
+        "client should see CommandComplete for its Execute: {msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, BackendMessage::ParseComplete)),
+        "injected re-prepare ParseComplete must not leak to the client: {msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, BackendMessage::CloseComplete)),
+        "injected eviction CloseComplete must not leak to the client: {msgs:?}"
+    );
+
+    drop(client);
+    let _ = handle.await;
+    mock.stop().await;
+}
+
+/// Send `Parse(name, query)` + `Sync` and collect responses through
+/// `ReadyForQuery`. Used to drive a single rejected-Parse transaction.
+async fn parse_only(
+    client: &mut Framed<TcpStream, BackendCodec>,
+    name: &str,
+    query: &str,
+) -> Vec<BackendMessage> {
+    client
+        .feed(FrontendMessage::Parse(
+            halephant_core::proto::frontend::Parse {
+                name: name.into(),
+                query: query.into(),
+                param_types: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client.send(FrontendMessage::Sync).await.unwrap();
+    let mut msgs = Vec::new();
+    loop {
+        let m = client.next().await.unwrap().unwrap();
+        let done = matches!(m, BackendMessage::ReadyForQuery(_));
+        msgs.push(m);
+        if done {
+            break;
+        }
+    }
+    msgs
+}
+
+/// A `Parse` the backend rejects must not leave a phantom entry in the
+/// per-connection prepared-statement cache. halephant inserts the
+/// canonical name optimistically before the backend confirms; if the
+/// backend answers `ErrorResponse` instead of `ParseComplete`, that
+/// insert must be rolled back. Otherwise the pooled (and reused)
+/// connection reports the canonical as prepared when it is not, so a
+/// later use is wrongly skipped — falsely "succeeding" or drawing
+/// "prepared statement does not exist".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_parse_does_not_leave_stale_cache_entry() {
+    use halephant_core::proxy::prepared::canonical_for_test;
+
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    // max=1 forces the second transaction to reuse the same backend.
+    let cfg = Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "5s"
+
+        [cluster.test]
+        nodes = ["{}"]
+
+        [cluster.test.pool.testdb]
+        max_connections = {{ primary = 1 }}
+
+        [cluster.test.pool.testdb.user.testuser]
+    "#,
+        mock.addr()
+    ))
+    .unwrap();
+    let (pools, _config) = setup_pool_with_config(cfg, &mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // Transaction 1: a Parse the backend rejects.
+    let tx1 = parse_only(&mut client, "s1", "SELECT INVALID").await;
+    assert!(
+        tx1.iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
+        "tx1 should surface the backend Parse error: {tx1:?}"
+    );
+
+    // Transaction 2 reuses the single backend with the SAME query. If the
+    // failed canonical were still cached, halephant would synthesize a
+    // ParseComplete and skip the backend — falsely reporting success.
+    // With rollback it re-forwards the Parse and the backend rejects it
+    // again.
+    let tx2 = parse_only(&mut client, "s2", "SELECT INVALID").await;
+    assert!(
+        tx2.iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
+        "tx2 must re-validate on the backend, not falsely succeed from a stale cache entry: {tx2:?}"
+    );
+
+    // The canonical Parse must have reached the backend both times.
+    let canon = canonical_for_test("SELECT INVALID", &[]);
+    let forwarded = mock
+        .received_parses()
+        .iter()
+        .filter(|n| **n == canon)
+        .count();
+    assert_eq!(
+        forwarded,
+        2,
+        "the rejected Parse should be re-forwarded on reuse, not skipped: {:?}",
+        mock.received_parses()
+    );
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    let _ = handle.await;
+    mock.stop().await;
+}
+
+/// Run one session-mode "client" against an already-checked-out backend:
+/// send `Parse(name, query)` + `Sync`, collect responses through
+/// `ReadyForQuery`, then disconnect so `session::forward` returns. The
+/// backend connection (`guard`) is reused across calls, modelling pool
+/// reuse of one upstream by successive client sessions.
+async fn session_prepare(
+    guard: &mut halephant_core::pool::ConnGuard,
+    pools: &Arc<PoolManager>,
+    name: &str,
+    query: &str,
+) -> Vec<BackendMessage> {
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+    let mut proxy = Framed::new(proxy_tcp, FrontendCodec::post_startup());
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    let session = halephant_core::proxy::session::forward(&mut proxy, guard.conn(), pools);
+    let driver = async {
+        client
+            .feed(FrontendMessage::Parse(
+                halephant_core::proto::frontend::Parse {
+                    name: name.into(),
+                    query: query.into(),
+                    param_types: vec![],
+                },
+            ))
+            .await
+            .unwrap();
+        client.send(FrontendMessage::Sync).await.unwrap();
+        let mut msgs = Vec::new();
+        loop {
+            let m = client.next().await.unwrap().unwrap();
+            let done = matches!(m, BackendMessage::ReadyForQuery(_));
+            msgs.push(m);
+            if done {
+                break;
+            }
+        }
+        drop(client); // disconnect → session::forward returns
+        msgs
+    };
+    let (session_res, msgs) = tokio::join!(session, driver);
+    session_res.unwrap();
+    msgs
+}
+
+/// Session mode binds one client to one backend, but the backend is
+/// reused by later clients. psycopg3-style drivers auto-name prepared
+/// statements per connection (`_pg3_0`, `_pg3_1`, …) restarting from 0
+/// each connection, so two different clients both prepare `_pg3_0` for
+/// different queries. If halephant forwards those names verbatim, the
+/// reused backend already has `_pg3_0` and rejects the second with
+/// `42P05 duplicate_prepared_statement`.
+///
+/// Canonicalizing names (`SHA-256(query, oids)`) — the same machinery
+/// transaction mode uses — makes the backend see distinct hashes, so no
+/// collision. This pins that session mode applies it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_mode_reused_backend_avoids_duplicate_prepared() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool_with_config(test_config_session(&mock.addr()), &mock);
+
+    let cg = test_client_guard();
+    let mut guard = pools
+        .checkout(&cg, "testdb", "testuser", false)
+        .await
+        .unwrap();
+
+    // Client A prepares "_pg3_0" = SELECT 1 and disconnects.
+    let a = session_prepare(&mut guard, &pools, "_pg3_0", "SELECT 1").await;
+    assert!(
+        !a.iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
+        "client A's prepare should succeed: {a:?}"
+    );
+
+    // Client B reuses the SAME backend and prepares "_pg3_0" = SELECT 2
+    // (a DIFFERENT query under the same client-supplied name).
+    let b = session_prepare(&mut guard, &pools, "_pg3_0", "SELECT 2").await;
+    assert!(
+        !b.iter()
+            .any(|m| matches!(m, BackendMessage::ErrorResponse(_))),
+        "client B must not collide on the reused backend's prepared name: {b:?}"
+    );
+    assert!(
+        b.iter().any(|m| matches!(m, BackendMessage::ParseComplete)),
+        "client B should see a ParseComplete: {b:?}"
+    );
+
+    drop(guard);
     mock.stop().await;
 }
 

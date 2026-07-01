@@ -4,6 +4,7 @@
 //! startup handshake (trust auth), simple query responses, and extended query
 //! protocol. Configurable to return canned responses or simulate failures.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,9 +16,9 @@ use tokio::sync::Notify;
 use tokio_util::codec::Framed;
 
 use halephant_core::auth::scram::ScramVerifier;
-use halephant_core::proto::backend::BackendMessage;
+use halephant_core::proto::backend::{BackendMessage, NoticeFields};
 use halephant_core::proto::codec::FrontendCodec;
-use halephant_core::proto::frontend::FrontendMessage;
+use halephant_core::proto::frontend::{FrontendMessage, TargetKind};
 use halephant_core::proto::types::TransactionStatus;
 use tinyscram::ServerSession;
 
@@ -231,6 +232,11 @@ async fn handle_connection(
 
     // Main loop: respond to messages.
     let mut in_transaction = false;
+    // Statement names currently prepared on this backend connection,
+    // mirroring real PostgreSQL: a non-empty name can only be prepared
+    // once until closed. Persists across the connection's lifetime
+    // (including pool checkin/reset, which never deallocates).
+    let mut prepared_names: HashSet<String> = HashSet::new();
 
     loop {
         let Some(msg) = conn.next().await.transpose()? else {
@@ -306,7 +312,22 @@ async fn handle_connection(
 
             FrontendMessage::Parse(ref parse) => {
                 received_parses.lock().push(parse.name.clone());
-                conn.send(BackendMessage::ParseComplete).await?;
+                // A query containing "INVALID" fails at Parse time, like a
+                // syntax/type error, and is NOT recorded as prepared.
+                if parse.query.to_ascii_uppercase().contains("INVALID") {
+                    conn.send(BackendMessage::ErrorResponse(parse_failed(&parse.query)))
+                        .await?;
+                } else if !parse.name.is_empty() && !prepared_names.insert(parse.name.clone()) {
+                    // A non-empty name already prepared on this connection
+                    // draws 42P05, exactly as PostgreSQL does. This is what
+                    // makes session-mode backend reuse (Issue 2) observable.
+                    conn.send(BackendMessage::ErrorResponse(duplicate_prepared(
+                        &parse.name,
+                    )))
+                    .await?;
+                } else {
+                    conn.send(BackendMessage::ParseComplete).await?;
+                }
             }
             FrontendMessage::Bind(_) => {
                 conn.send(BackendMessage::BindComplete).await?;
@@ -329,10 +350,41 @@ async fn handle_connection(
             }
             FrontendMessage::Close(ref close) => {
                 received_closes.lock().push(close.name.clone());
+                // Closing a prepared statement frees its name for reuse.
+                // Portal closes don't touch the statement namespace.
+                if close.kind == TargetKind::Statement {
+                    prepared_names.remove(&close.name);
+                }
                 conn.send(BackendMessage::CloseComplete).await?;
             }
             _ => {}
         }
+    }
+}
+
+/// Build a `42P05 duplicate_prepared_statement` error matching what
+/// PostgreSQL returns when a statement name is already prepared.
+fn duplicate_prepared(name: &str) -> NoticeFields {
+    NoticeFields {
+        fields: vec![
+            (b'S', "ERROR".to_owned()),
+            (b'C', "42P05".to_owned()),
+            (
+                b'M',
+                format!("prepared statement \"{name}\" already exists"),
+            ),
+        ],
+    }
+}
+
+/// Build a `42601 syntax_error` for a `Parse` that fails on the backend.
+fn parse_failed(query: &str) -> NoticeFields {
+    NoticeFields {
+        fields: vec![
+            (b'S', "ERROR".to_owned()),
+            (b'C', "42601".to_owned()),
+            (b'M', format!("syntax error in query: {query}")),
+        ],
     }
 }
 

@@ -71,7 +71,7 @@ pub enum Statement {
     /// `ClientPrepared`, releases the refcount in the global
     /// `StatementStore`, and synthesises a `CommandComplete` response
     /// without forwarding to the server — the actual server-side
-    /// statement is eventually reclaimed by `ServerPrepared`'s LRU.
+    /// statement is eventually reclaimed by `PreparedStatements`' LRU.
     Deallocate { target: DeallocateTarget },
 
     /// `BEGIN [transaction_mode ...]` or `START TRANSACTION
@@ -219,7 +219,7 @@ pub enum DiscardTarget {
     /// `DISCARD ALL` — full session reset. Drops prepared statements
     /// (DEALLOCATE ALL), resets every GUC (RESET ALL), closes cursors,
     /// and drops temp tables. Halephant must clear both its
-    /// `ServerPrepared` tracker and its `dirty_vars` set on the
+    /// `PreparedStatements` cache and its `dirty_vars` set on the
     /// affected connection.
     All,
     /// `DISCARD PLANS` — releases cached query plans only. The

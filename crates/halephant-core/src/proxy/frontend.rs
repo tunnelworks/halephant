@@ -238,7 +238,7 @@ async fn forward_inner(
             // (which stands in for "actively holding a backend").
             client_guard.set_state(ClientState::InTransaction);
             async {
-                let result = proxy::session::forward(&mut client, guard.conn()).await;
+                let result = proxy::session::forward(&mut client, guard.conn(), pools).await;
                 let span = tracing::Span::current();
                 match &result {
                     Ok(()) => {

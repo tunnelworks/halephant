@@ -15,7 +15,7 @@ use tracing::{Instrument, debug, field, info_span, trace, warn};
 use crate::clients::{ClientGuard, ClientState};
 use crate::config::cluster::pool::ListenMode;
 use crate::config::otel::QueryText;
-use crate::connections::server::ServerConn;
+use crate::connections::server::{Reply, ServerConn};
 use crate::listener::ClientNotifications;
 use crate::o11y;
 use crate::pool::PoolManager;
@@ -23,7 +23,7 @@ use crate::proto;
 use crate::proxy::intercept::{
     handle_close_intercept, handle_deallocate_intercept, handle_listen_intercept,
 };
-use crate::proxy::prepared::{ClientPrepared, rewrite_outbound};
+use crate::proxy::prepared::{ClientPrepared, PreparedGuard, rewrite_outbound};
 use crate::sql;
 
 /// Track session-state-affecting commands on the server connection so
@@ -32,7 +32,7 @@ use crate::sql;
 ///
 /// - `server.dirty_vars` — GUC variables the client has SET and that
 ///   `reset_connection` must RESET on checkin.
-/// - `server.prepared` — canonical names of prepared statements
+/// - `server.statements` — canonical names of prepared statements
 ///   registered on this backend via `ensure_prepared`.
 ///
 /// Only tracks the simple query protocol (Query messages) — a SET
@@ -65,7 +65,7 @@ fn track_set_reset(msg: &proto::frontend::FrontendMessage, server: &mut ServerCo
         sql::Statement::Discard {
             target: sql::DiscardTarget::All,
         } => {
-            server.prepared.clear();
+            server.statements.discard_all();
             server.dirty_vars.clear();
         }
         _ => {}
@@ -113,19 +113,6 @@ pub async fn forward(
         query_text,
     )
     .await
-}
-
-/// Drop guard that ensures `release_all` runs even if the task is cancelled.
-struct PreparedGuard {
-    inner: ClientPrepared,
-    pools: Arc<PoolManager>,
-}
-
-impl Drop for PreparedGuard {
-    fn drop(&mut self) {
-        let mut store = self.pools.stmt_store.lock();
-        self.inner.release_all(&mut store);
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -218,6 +205,19 @@ async fn forward_loop(
                     .await?;
                 client_guard.set_state(ClientState::InTransaction);
                 tracing::Span::current().record("server.address", guard.node());
+
+                // Reset this connection's injected-response FIFOs only. A
+                // client that disconnected mid extended-protocol batch can
+                // leave a ParseComplete/CloseComplete disposition whose reply
+                // the backend skipped and will never send; clearing here
+                // keeps it from misaligning this transaction's filter.
+                //
+                // This is NOT where stale prepared-cache entries are handled:
+                // a rejected `Parse` rolls back its optimistic insert at the
+                // `ErrorResponse` arm below (before checkin), so it never
+                // reaches a later checkout. `reset_pending` is FIFO alignment
+                // only, not a catch-all for error-induced staleness.
+                guard.conn().statements.reset_pending();
 
                 // In pin mode, check if the first message is LISTEN — pin immediately.
                 let mut pinned = false;
@@ -420,7 +420,36 @@ async fn forward_until_idle(
                 }
                 Some(proto::backend::BackendMessage::ErrorResponse(ref err)) => {
                     tracker.on_error(err.message().unwrap_or("unknown"));
+                    // The error aborts the extended-protocol batch: every
+                    // message after it is skipped, so any Parse halephant
+                    // recorded optimistically will never be confirmed. Roll
+                    // those inserts back so the pooled connection doesn't
+                    // claim statements the backend never prepared.
+                    server.statements.roll_back_after_error();
                     client.send(proto::backend::BackendMessage::ErrorResponse(err.clone())).await?;
+                }
+                Some(proto::backend::BackendMessage::ParseComplete) => {
+                    // A ParseComplete answers a Parse halephant either
+                    // forwarded for the client (deliver it) or injected to
+                    // re-prepare on the client's behalf (swallow it). The
+                    // disposition was recorded in send order when the Parse
+                    // went out.
+                    match server.statements.next_parse_reply() {
+                        Reply::Suppress => trace!("suppressing injected ParseComplete"),
+                        Reply::Forward => {
+                            client.send(proto::backend::BackendMessage::ParseComplete).await?;
+                        }
+                    }
+                }
+                Some(proto::backend::BackendMessage::CloseComplete) => {
+                    // Likewise for CloseComplete: forward the client's portal
+                    // closes, swallow halephant's LRU-eviction closes.
+                    match server.statements.next_close_reply() {
+                        Reply::Suppress => trace!("suppressing injected CloseComplete"),
+                        Reply::Forward => {
+                            client.send(proto::backend::BackendMessage::CloseComplete).await?;
+                        }
+                    }
                 }
                 Some(msg) => {
                     trace!(?msg, "server -> client");
