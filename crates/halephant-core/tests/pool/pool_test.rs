@@ -2293,6 +2293,99 @@ enum Tag {
     Command,
 }
 
+/// Two SEPARATE autocommit extended-protocol batches pipelined in one
+/// flush (each `Parse`/`Bind`/`Execute`/`Sync`) must each run as their
+/// own transaction. The proxy must not read batch 2 onto batch 1's
+/// backend and then strand batch 2's responses when batch 1's
+/// `ReadyForQuery(Idle)` checks that backend back in.
+///
+/// This is the shape tokio-postgres produces: after a query it pipelines
+/// `Close(statement)`/`Sync` (deallocate) ahead of the next query's
+/// `Parse`/.../`Sync`. The mock is deliberately slow so the proxy reads
+/// the whole pipelined buffer before any reply arrives, deterministically
+/// forcing the read-ahead path that used to hang real drivers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_autocommit_batches_each_get_a_transaction() {
+    let mock = MockPg::start_slow(MockBehavior::Ok, std::time::Duration::from_millis(20)).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // Buffer two full batches, then flush them together (pipelined).
+    for (name, query) in [("a", "SELECT 1"), ("b", "SELECT 2")] {
+        client
+            .feed(FrontendMessage::Parse(
+                halephant_core::proto::frontend::Parse {
+                    name: name.into(),
+                    query: query.into(),
+                    param_types: vec![],
+                },
+            ))
+            .await
+            .unwrap();
+        client
+            .feed(FrontendMessage::Bind(
+                halephant_core::proto::frontend::Bind {
+                    portal: String::new(),
+                    statement: name.into(),
+                    param_formats: vec![],
+                    params: vec![],
+                    result_formats: vec![],
+                },
+            ))
+            .await
+            .unwrap();
+        client
+            .feed(FrontendMessage::Execute(
+                halephant_core::proto::frontend::Execute {
+                    portal: String::new(),
+                    max_rows: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        client.feed(FrontendMessage::Sync).await.unwrap();
+    }
+    SinkExt::flush(&mut client).await.unwrap();
+
+    // On the read-ahead bug, batch 2's responses are stranded and this
+    // times out. With one transaction per batch, both ReadyForQuery and
+    // both CommandComplete arrive.
+    let counted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut completes = 0;
+        let mut readies = 0;
+        while readies < 2 {
+            match client.next().await {
+                Some(Ok(BackendMessage::CommandComplete(_))) => completes += 1,
+                Some(Ok(BackendMessage::ReadyForQuery(_))) => readies += 1,
+                Some(Ok(BackendMessage::ErrorResponse(e))) => {
+                    panic!("unexpected error in pipelined batch: {e:?}")
+                }
+                Some(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        (completes, readies)
+    })
+    .await
+    .expect("timed out — batch 2's responses were stranded (read-ahead across Sync)");
+
+    assert_eq!(
+        counted.1, 2,
+        "expected one ReadyForQuery per pipelined batch"
+    );
+    assert_eq!(
+        counted.0, 2,
+        "expected one CommandComplete per pipelined batch"
+    );
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    let _ = handle.await;
+    mock.stop().await;
+}
+
 /// A client that pipelines two extended-protocol statements in a single
 /// implicit transaction — `Parse`/`Bind`/`Execute` twice, then one
 /// trailing `Sync` — must receive every response for BOTH statements, in

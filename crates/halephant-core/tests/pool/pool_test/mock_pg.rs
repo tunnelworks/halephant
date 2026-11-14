@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -87,15 +88,27 @@ pub(crate) fn test_verifier(password: &str) -> ScramVerifier {
 impl MockPg {
     /// Start a mock PostgreSQL server on a random port.
     pub(crate) async fn start(behavior: MockBehavior) -> Self {
-        Self::start_with_opts(behavior, false).await
+        Self::start_with_opts(behavior, false, Duration::ZERO).await
     }
 
     /// Start a mock that advertises itself as a replica (for topology discovery).
     pub(crate) async fn start_replica(behavior: MockBehavior) -> Self {
-        Self::start_with_opts(behavior, true).await
+        Self::start_with_opts(behavior, true, Duration::ZERO).await
     }
 
-    async fn start_with_opts(behavior: MockBehavior, is_replica: bool) -> Self {
+    /// Start a mock that sleeps `delay` before answering each message in the
+    /// main loop. A slow backend lets a pipelining client's buffered
+    /// follow-on messages be read by the proxy before any reply arrives,
+    /// which deterministically exposes read-ahead-across-`Sync` bugs.
+    pub(crate) async fn start_slow(behavior: MockBehavior, delay: Duration) -> Self {
+        Self::start_with_opts(behavior, false, delay).await
+    }
+
+    async fn start_with_opts(
+        behavior: MockBehavior,
+        is_replica: bool,
+        response_delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = Arc::new(Notify::new());
@@ -121,7 +134,7 @@ impl MockPg {
                         let parses = Arc::clone(&parses_for_task);
                         let closes = Arc::clone(&closes_for_task);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, behavior, is_replica, queries, parses, closes).await {
+                            if let Err(e) = handle_connection(stream, behavior, is_replica, response_delay, queries, parses, closes).await {
                                 let _ = e;
                             }
                         });
@@ -179,6 +192,7 @@ async fn handle_connection(
     stream: TcpStream,
     behavior: MockBehavior,
     is_replica: bool,
+    response_delay: Duration,
     received_queries: Arc<Mutex<Vec<String>>>,
     received_parses: Arc<Mutex<Vec<String>>>,
     received_closes: Arc<Mutex<Vec<String>>>,
@@ -242,6 +256,12 @@ async fn handle_connection(
         let Some(msg) = conn.next().await.transpose()? else {
             return Ok(());
         };
+
+        // Optional slow backend: lets a pipelining client's buffered
+        // follow-on messages reach the proxy before any reply does.
+        if !response_delay.is_zero() {
+            tokio::time::sleep(response_delay).await;
+        }
 
         match msg {
             FrontendMessage::Terminate => return Ok(()),

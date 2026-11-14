@@ -231,14 +231,26 @@ async fn forward_loop(
                 let mut tracker = o11y::spans::StatementTracker::new(query_text);
 
                 // Track SET/RESET and rewrite/send the first message.
+                // A first message that is itself a `Sync` ends its
+                // (empty) batch immediately, so the inner loop must wait
+                // for that `Sync`'s `ReadyForQuery` before reading any
+                // pipelined follow-on messages (which belong to the next
+                // transaction and need a fresh checkout).
                 tracker.on_client_msg(&first_msg, |name| {
                     resolve_stmt_query(name, client_prepared, pools)
                 });
                 track_set_reset(&first_msg, guard.conn());
+                // Derive the batch boundary from what actually reaches the
+                // backend, not the raw message: if `rewrite_outbound`
+                // suppresses the `Sync` (returns `None`), no `ReadyForQuery`
+                // is owed and the gate must stay open. Mirrors the inner-loop
+                // check below and eliminates the coupling to the raw message.
+                let mut first_ends_batch = false;
                 if let Some(first_msg) =
                     rewrite_outbound(first_msg, client_prepared, guard.conn(), pools, client)
                         .await?
                 {
+                    first_ends_batch = matches!(first_msg, proto::frontend::FrontendMessage::Sync);
                     guard.conn().framed.send(first_msg).await?;
                 }
                 debug!("transaction started");
@@ -254,6 +266,7 @@ async fn forward_loop(
                     pools,
                     txn_read_only,
                     &mut tracker,
+                    first_ends_batch,
                 )
                 .await;
 
@@ -314,7 +327,23 @@ async fn forward_until_idle(
     pools: &Arc<PoolManager>,
     txn_read_only: bool,
     tracker: &mut o11y::spans::StatementTracker,
+    awaiting_ready: bool,
 ) -> anyhow::Result<Release> {
+    // While `awaiting_ready` is set, a `Sync` has been forwarded and the
+    // backend owes a `ReadyForQuery`; we must NOT read further client
+    // messages, because a client that pipelines batches has the *next*
+    // transaction's messages already buffered, and forwarding them onto
+    // this (about-to-be-checked-in) backend would strand their responses
+    // when this batch's `ReadyForQuery(Idle)` returns us to the pool.
+    let mut awaiting_ready = awaiting_ready;
+    // Whether a real `ReadyForQuery(InTransaction|Failed)` has confirmed we
+    // are inside an explicit `BEGIN`…`COMMIT`. While held that way the
+    // backend is ours until the transaction ends, so cross-`Sync` read-ahead
+    // is safe and the gate is skipped to keep intra-transaction pipelining.
+    // It must start `false` (not derive from `last_server_status`, whose
+    // optimistic `InTransaction` default below would wrongly relax the gate
+    // and let the first autocommit batch be read past).
+    let mut in_explicit_txn = false;
     // Track the most recent transaction status from the server so
     // synthetic responses for intercepted client messages reflect
     // the actual session state. The default is `InTransaction`
@@ -328,7 +357,7 @@ async fn forward_until_idle(
 
     loop {
         tokio::select! {
-            msg = client.next() => match msg.transpose()? {
+            msg = client.next(), if !awaiting_ready => match msg.transpose()? {
                 Some(proto::frontend::FrontendMessage::Terminate) => {
                     trace!("client sent Terminate (in transaction)");
                     return Ok(Release::ClientDone);
@@ -394,6 +423,18 @@ async fn forward_until_idle(
                     // Track SET/RESET and rewrite prepared statement names.
                     track_set_reset(&msg, server);
                     if let Some(msg) = rewrite_outbound(msg, client_prepared, server, pools, client).await? {
+                        // A `Sync` ends the current extended-protocol batch.
+                        // In autocommit the next `ReadyForQuery(Idle)` checks
+                        // this backend in, so stop reading the client until it
+                        // arrives — otherwise a pipelining client's next batch
+                        // is read ahead onto this backend and stranded. Inside
+                        // an explicit transaction the backend is held to
+                        // COMMIT, so read-ahead is safe and the gate is skipped.
+                        if matches!(msg, proto::frontend::FrontendMessage::Sync)
+                            && !in_explicit_txn
+                        {
+                            awaiting_ready = true;
+                        }
                         trace!(?msg, "client -> server");
                         server.framed.send(msg).await?;
                     }
@@ -402,6 +443,11 @@ async fn forward_until_idle(
             },
             msg = server.framed.next() => match msg.transpose()? {
                 Some(proto::backend::BackendMessage::ReadyForQuery(status)) => {
+                    // The batch's boundary arrived — resume reading the client.
+                    awaiting_ready = false;
+                    // A non-`Idle` status means we're held inside an explicit
+                    // transaction, where the gate above can be relaxed.
+                    in_explicit_txn = status != proto::types::TransactionStatus::Idle;
                     last_server_status = status;
                     server.last_tx_status = status;
                     tracker.drain();
