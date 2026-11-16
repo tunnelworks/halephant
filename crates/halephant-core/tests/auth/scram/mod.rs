@@ -127,7 +127,7 @@ fn sasl_initial_no_response_data() {
 
     let (mech, resp) = parse_sasl_initial_response(&buf).unwrap();
     assert_eq!(mech, "SCRAM-SHA-256");
-    assert!(resp.is_empty());
+    assert_eq!(resp, b"");
 }
 
 #[test]

@@ -14,18 +14,13 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 chumsky = { workspace = true }
 futures-util = { workspace = true }
-hmac = { workspace = true }
-humantime = { workspace = true }
 humantime-serde = { workspace = true }
 moka = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
-pbkdf2 = { workspace = true }
-rand = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
-subtle = { workspace = true }
 sql_lexer = { workspace = true }
 thiserror = { workspace = true }
 tinyscram = { workspace = true }
@@ -37,6 +32,8 @@ utoipa = { workspace = true }
 utoipa-scalar = { workspace = true }
 
 [dev-dependencies]
+hmac = { workspace = true }
+pbkdf2 = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

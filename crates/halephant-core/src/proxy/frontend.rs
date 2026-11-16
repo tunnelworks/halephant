@@ -145,8 +145,7 @@ async fn forward_inner(
 
     let mode = config
         .find_pool(&database)
-        .map(|(_, _, p)| p.mode)
-        .unwrap_or_default();
+        .map_or_default(|(_, _, p)| p.mode);
     let read_only = config
         .find_user(&database, &user)
         .is_some_and(crate::config::cluster::pool::user::UserConfig::is_read_only);
@@ -329,6 +328,5 @@ fn startup_param(params: &[(String, String)], key: &str) -> String {
     params
         .iter()
         .find(|(k, _)| k == key)
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default()
+        .map_or_default(|(_, v)| v.clone())
 }

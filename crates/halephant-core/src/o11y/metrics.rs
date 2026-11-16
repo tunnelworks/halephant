@@ -151,7 +151,7 @@ pub struct PoolLimits {
 
 /// Snapshot of a single wait queue: (database, user, role) plus how
 /// many clients are currently blocked and how long the oldest has been
-/// waiting. Returned by [`PoolManager::queue_stats`].
+/// waiting. Returned by [`crate::pool::PoolManager::queue_stats`].
 pub struct QueueInfo {
     pub database: String,
     pub user: String,

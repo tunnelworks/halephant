@@ -55,10 +55,7 @@ impl TopologyManager {
     /// Get the current replica addresses for a cluster.
     pub fn replicas(&self, cluster: &str) -> Vec<String> {
         let state = self.state.lock();
-        state
-            .get(cluster)
-            .map(|t| t.replicas.clone())
-            .unwrap_or_default()
+        state.get(cluster).map_or_default(|t| t.replicas.clone())
     }
 
     /// Get the full topology snapshot for a cluster.

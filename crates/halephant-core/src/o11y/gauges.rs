@@ -98,7 +98,7 @@ pub fn register_pool_gauges(
                 if limits.max_replica > 0 {
                     observer.observe(
                         u64::from(limits.max_replica),
-                        &[db.clone(), KeyValue::new("role", "replica")],
+                        &[db, KeyValue::new("role", "replica")],
                     );
                 }
             }

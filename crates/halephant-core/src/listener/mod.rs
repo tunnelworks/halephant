@@ -279,9 +279,7 @@ async fn listener_task(
                 let upstream_user = user_config
                     .map_or(user.as_str(), |u| u.upstream_name(&user))
                     .to_owned();
-                let params = user_config
-                    .map(|u| u.parameters.clone())
-                    .unwrap_or_default();
+                let params = user_config.map_or_default(|u| u.parameters.clone());
                 (
                     name,
                     cluster.connect_timeout,
