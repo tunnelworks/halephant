@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 
 COPY --from=builder --chmod=0555 /build/target/release/halephant /usr/local/bin/halephant
 
-USER halephant
+USER 1000:1000
 WORKDIR /etc/halephant
 
 COPY --chmod=0444 --chown=halephant:halephant examples/docker.toml halephant.toml
@@ -20,6 +20,6 @@ COPY --chmod=0444 --chown=halephant:halephant examples/docker.toml halephant.tom
 EXPOSE 6432 6433
 
 HEALTHCHECK --interval=10s --timeout=2s --retries=3 --start-period=5s --start-interval=1s \
-    CMD curl -sf http://127.0.0.1:6433/ready || exit 1
+    CMD ["curl", "-sf", "http://127.0.0.1:6433/ready"]
 
 CMD ["halephant", "-c", "/etc/halephant/halephant.toml"]
