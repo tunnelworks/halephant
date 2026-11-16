@@ -197,8 +197,7 @@ async fn run(config: Config, config_path: &Path) -> anyhow::Result<()> {
             std::env::var("PGPASSFILE").map_or_else(
                 |_| {
                     std::env::var("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_default()
+                        .map_or_default(PathBuf::from)
                         .join(".pgpass")
                 },
                 PathBuf::from,
