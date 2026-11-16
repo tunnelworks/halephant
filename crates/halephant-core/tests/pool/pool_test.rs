@@ -12,6 +12,7 @@ use tokio_util::codec::Framed;
 use halephant_core::config::Config;
 use halephant_core::config::cluster::pool::ListenMode;
 use halephant_core::pool::PoolManager;
+use halephant_core::pool::types::{CheckoutError, classify_checkout_error};
 use halephant_core::proto::backend::BackendMessage;
 use halephant_core::proto::codec::{BackendCodec, FrontendCodec};
 use halephant_core::proto::frontend::FrontendMessage;
@@ -1669,6 +1670,14 @@ async fn shutdown_wakes_queued_waiters() {
         err.to_string().contains("shutting down"),
         "error should mention shutdown, got: {err}"
     );
+    assert!(
+        matches!(
+            err.downcast_ref::<CheckoutError>(),
+            Some(CheckoutError::ShuttingDown)
+        ),
+        "shutdown should downcast to CheckoutError::ShuttingDown"
+    );
+    assert_eq!(classify_checkout_error(&err), "shutting_down");
 
     mock.stop().await;
 }
@@ -1834,6 +1843,168 @@ async fn per_pool_checkout_timeout_overrides_server_default() {
     );
     assert!(result.err().unwrap().to_string().contains("timed out"));
 
+    mock.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Checkout failure classification
+// ---------------------------------------------------------------------------
+
+/// A checkout that exhausts `checkout_timeout` fails with the typed
+/// [`CheckoutError::Timeout`], so the metric classification downcasts
+/// instead of substring-matching error prose. The operator-facing
+/// Display text stays stable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_timeout_error_is_typed() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool_with_config(test_config_max(&mock.addr(), 1), &mock);
+
+    let client = test_client_guard();
+    let _guard = pools
+        .checkout(&client, "testdb", "testuser", false)
+        .await
+        .unwrap();
+
+    let err = pools
+        .checkout(&client, "testdb", "testuser", false)
+        .await
+        .err()
+        .expect("second checkout should time out at max=1");
+    assert!(
+        matches!(
+            err.downcast_ref::<CheckoutError>(),
+            Some(CheckoutError::Timeout { .. })
+        ),
+        "timeout should downcast to CheckoutError::Timeout, got: {err}"
+    );
+    assert!(err.to_string().contains("timed out"));
+    assert_eq!(classify_checkout_error(&err), "checkout_timeout");
+
+    mock.stop().await;
+}
+
+/// An upstream that refuses startup with PostgreSQL's own shutdown
+/// error (`57P03` — "the database system is shutting down") is a
+/// connect failure, not halephant shutting down. The old substring
+/// classification confused the two because the upstream's prose leaks
+/// into the anyhow message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_shutdown_error_is_a_connect_failure() {
+    let mock = MockPg::start(MockBehavior::ErrorOnStartup {
+        code: "57P03".into(),
+        message: "the database system is shutting down".into(),
+    })
+    .await;
+    let (pools, _config) = setup_pool(&mock);
+
+    let client = test_client_guard();
+    let err = pools
+        .checkout(&client, "testdb", "testuser", false)
+        .await
+        .err()
+        .expect("checkout against a shutting-down upstream should fail");
+
+    assert!(
+        err.to_string().contains("shutting down"),
+        "expected the upstream error text to surface, got: {err}"
+    );
+    assert!(
+        err.downcast_ref::<CheckoutError>().is_none(),
+        "an upstream connect failure must not be typed as CheckoutError"
+    );
+    assert_eq!(classify_checkout_error(&err), "connect_failed");
+
+    mock.stop().await;
+}
+
+/// An unconfigured user is refused before any upstream connection
+/// attempt — the mock never sees a connect. The pre-fix fallback
+/// connected as the client-facing name instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unconfigured_user_never_reaches_upstream() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+
+    let client = test_client_guard();
+    let err = pools
+        .checkout(&client, "testdb", "ghost", false)
+        .await
+        .err()
+        .expect("unconfigured user should be refused");
+    assert!(
+        matches!(
+            err.downcast_ref::<CheckoutError>(),
+            Some(CheckoutError::UserNotConfigured { .. })
+        ),
+        "refusal should downcast to CheckoutError::UserNotConfigured, got: {err}"
+    );
+    assert_eq!(
+        mock.connections(),
+        0,
+        "refusal must not open an upstream connection"
+    );
+
+    mock.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Pool identity — checkout and refill share one connect identity
+// ---------------------------------------------------------------------------
+
+fn test_config_alias(node_addr: &str, min_primary: u32) -> Config {
+    Config::parse(&format!(
+        r#"
+        [server]
+        checkout_timeout = "{TEST_CHECKOUT_TIMEOUT}"
+
+        [cluster.test]
+        nodes = ["{node_addr}"]
+
+        [cluster.test.pool.testdb]
+        max_connections = {{ primary = 10 }}
+
+        [cluster.test.pool.testdb.user.app]
+        alias = "app_rw"
+        min_connections = {{ primary = {min_primary} }}
+    "#
+    ))
+    .unwrap()
+}
+
+/// Checkout resolves the upstream identity through the shared
+/// `ConnectSpec` resolver: a configured alias connects as the aliased
+/// role, not the client-facing name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_connects_as_configured_alias() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool_with_config(test_config_alias(&mock.addr(), 0), &mock);
+
+    let client = test_client_guard();
+    let guard = pools
+        .checkout(&client, "testdb", "app", false)
+        .await
+        .expect("checkout for the aliased user should succeed");
+    assert_eq!(mock.received_startup_users(), vec!["app_rw".to_owned()]);
+
+    drop(guard);
+    mock.stop().await;
+}
+
+/// Warm-up refill resolves the same upstream identity as checkout —
+/// both consume one `ConnectSpec`, so a pool can never mix connections
+/// authenticated as different roles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warm_up_connects_as_configured_alias() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool_with_config(test_config_alias(&mock.addr(), 2), &mock);
+
+    pools.warm_up().await;
+
+    assert_eq!(
+        mock.received_startup_users(),
+        vec!["app_rw".to_owned(), "app_rw".to_owned()],
+        "every warm-up connection should authenticate as the alias"
+    );
     mock.stop().await;
 }
 
@@ -3102,4 +3273,425 @@ async fn read_only_user_does_not_fall_back_to_primary() {
     drop((g1, g2));
     primary.stop().await;
     replica.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Message classification boundaries — protocol-scoped intercepts, SET
+// tracking, pin-mode LISTEN, and the explicit-transaction Sync gate
+// ---------------------------------------------------------------------------
+
+/// Feed a full extended-protocol batch (`Parse`/`Bind`/`Execute`/`Sync`)
+/// without flushing, so several batches can be pipelined into one flush.
+async fn feed_extended_batch(
+    client: &mut Framed<TcpStream, BackendCodec>,
+    name: &str,
+    query: &str,
+) {
+    client
+        .feed(FrontendMessage::Parse(
+            halephant_core::proto::frontend::Parse {
+                name: name.into(),
+                query: query.into(),
+                param_types: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .feed(FrontendMessage::Bind(
+            halephant_core::proto::frontend::Bind {
+                portal: String::new(),
+                statement: name.into(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            },
+        ))
+        .await
+        .unwrap();
+    client
+        .feed(FrontendMessage::Execute(
+            halephant_core::proto::frontend::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+        ))
+        .await
+        .unwrap();
+    client.feed(FrontendMessage::Sync).await.unwrap();
+}
+
+/// Collect responses until (and including) the next `ReadyForQuery`.
+async fn collect_until_ready(client: &mut Framed<TcpStream, BackendCodec>) -> Vec<BackendMessage> {
+    let mut msgs = Vec::new();
+    loop {
+        let msg = client.next().await.unwrap().unwrap();
+        let done = matches!(msg, BackendMessage::ReadyForQuery(_));
+        msgs.push(msg);
+        if done {
+            return msgs;
+        }
+    }
+}
+
+/// Poll until the pool holds at least `want` idle connections, proving the
+/// background reset-and-checkin completed. Panics after 2 s.
+async fn wait_for_idle(pools: &PoolManager, want: u32) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while total_idle(pools) < want {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "connection was not reset and returned to the idle pool within 2 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// A pipelined explicit transaction — `BEGIN`, two extended-protocol
+/// batches, `COMMIT`, all flushed together — must flow on a single backend
+/// with every response delivered. The `Sync` gate must hold before the
+/// server confirms the transaction (the proxy cannot yet know the session
+/// isn't autocommit) and relax once `ReadyForQuery(InTransaction)` arrives,
+/// so the in-transaction batches pipeline freely without stranding any
+/// response. The slow mock guarantees the proxy reads the whole pipelined
+/// buffer before the first server reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipelined_explicit_transaction_batches_flow_on_one_backend() {
+    let mock = MockPg::start_slow(MockBehavior::Ok, std::time::Duration::from_millis(20)).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // BEGIN, two extended-protocol batches, COMMIT — one flush.
+    client
+        .feed(FrontendMessage::Query("BEGIN".into()))
+        .await
+        .unwrap();
+    feed_extended_batch(&mut client, "s1", "SELECT 1").await;
+    feed_extended_batch(&mut client, "s2", "SELECT 2").await;
+    client
+        .feed(FrontendMessage::Query("COMMIT".into()))
+        .await
+        .unwrap();
+    SinkExt::flush(&mut client).await.unwrap();
+
+    // Collect until the COMMIT's ReadyForQuery(Idle); a stranded batch
+    // fails the timeout instead of hanging the test.
+    let msgs = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut msgs = Vec::new();
+        loop {
+            let msg = client.next().await.unwrap().unwrap();
+            let done = matches!(msg, BackendMessage::ReadyForQuery(TransactionStatus::Idle));
+            msgs.push(msg);
+            if done {
+                break;
+            }
+        }
+        msgs
+    })
+    .await
+    .expect("timed out — an in-transaction pipelined batch was stranded");
+
+    let readies: Vec<TransactionStatus> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            BackendMessage::ReadyForQuery(s) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        readies,
+        vec![
+            TransactionStatus::InTransaction, // BEGIN
+            TransactionStatus::InTransaction, // batch s1
+            TransactionStatus::InTransaction, // batch s2
+            TransactionStatus::Idle,          // COMMIT
+        ],
+        "expected one ReadyForQuery per batch with in-transaction statuses: {msgs:?}"
+    );
+    let completes = msgs
+        .iter()
+        .filter(|m| matches!(m, BackendMessage::CommandComplete(_)))
+        .count();
+    assert_eq!(
+        completes, 4,
+        "BEGIN, both Executes, and COMMIT must each complete: {msgs:?}"
+    );
+    let parses = msgs
+        .iter()
+        .filter(|m| matches!(m, BackendMessage::ParseComplete))
+        .count();
+    assert_eq!(
+        parses, 2,
+        "both ParseComplete must reach the client: {msgs:?}"
+    );
+    assert_eq!(
+        mock.connections(),
+        1,
+        "the explicit transaction must hold a single backend"
+    );
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    handle.await.unwrap().unwrap();
+    mock.stop().await;
+}
+
+/// A `SET` sent through the simple query protocol executes immediately, so
+/// halephant tracks the variable and RESETs it when the connection returns
+/// to the pool. Positive control for the Parse-carried case below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_via_query_is_reset_on_checkin() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    let _ = query_collect(&mut client, "SET application_name TO 'trackme'").await;
+
+    // The reset round trip completes before the connection reaches the
+    // idle pool, so received_queries is settled once idle appears.
+    wait_for_idle(&pools, 1).await;
+    let received = mock.received_queries();
+    assert!(
+        received
+            .iter()
+            .any(|q| q.contains("RESET application_name")),
+        "checkin must RESET the session-SET variable, got: {received:?}"
+    );
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    handle.await.unwrap().unwrap();
+    mock.stop().await;
+}
+
+/// A `SET` carried inside an extended-protocol `Parse` is prepared, not
+/// executed, so halephant must NOT track it: the checkin reset would
+/// otherwise RESET a variable the session never actually set. Guards the
+/// protocol boundary of the SET tracker (simple-protocol `Query`
+/// statements only).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_via_parse_is_not_tracked_for_reset() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    extended_query(
+        &mut client,
+        "set_stmt",
+        "SET application_name TO 'untracked'",
+    )
+    .await;
+
+    wait_for_idle(&pools, 1).await;
+    let received = mock.received_queries();
+    assert!(
+        !received
+            .iter()
+            .any(|q| q.contains("RESET application_name")),
+        "a Parse-carried SET must not be tracked for reset, got: {received:?}"
+    );
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    handle.await.unwrap().unwrap();
+    mock.stop().await;
+}
+
+/// A `DEALLOCATE` carried inside an extended-protocol `Parse` must be
+/// forwarded, not intercepted: interception is simple-query-protocol only,
+/// and a synthetic `CommandComplete` + `ReadyForQuery` here would
+/// desynchronize the extended-protocol response stream the client expects
+/// (`ParseComplete`/`BindComplete`/...).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deallocate_via_parse_is_forwarded_not_intercepted() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool(&mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    feed_extended_batch(&mut client, "d1", "DEALLOCATE ALL").await;
+    SinkExt::flush(&mut client).await.unwrap();
+    let msgs = collect_until_ready(&mut client).await;
+
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, BackendMessage::ParseComplete)),
+        "the DEALLOCATE Parse must draw a ParseComplete: {msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, BackendMessage::BindComplete)),
+        "the batch must complete through the backend: {msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, BackendMessage::CommandComplete(tag) if tag == "DEALLOCATE")),
+        "extended-protocol DEALLOCATE must not draw the synthetic simple-query response: {msgs:?}"
+    );
+    assert_eq!(
+        mock.received_parses().len(),
+        1,
+        "the DEALLOCATE Parse must reach the backend"
+    );
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    handle.await.unwrap().unwrap();
+    mock.stop().await;
+}
+
+/// In pin mode a `LISTEN` switches the client to session-style pinning:
+/// the backend stays checked out across `ReadyForQuery(Idle)` until
+/// `UNLISTEN *`. While pinned, a synthetic intercept reply must carry the
+/// real server status (`Idle` after the LISTEN completed), and the pool
+/// must refuse the pinned connection to other clients.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pin_mode_listen_pins_connection_until_unlisten_star() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool_with_config(test_config_max(&mock.addr(), 1), &mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    // LISTEN as the first message of a checkout pins immediately, and pin
+    // mode forwards it to the backend (no interception).
+    let msgs = query_collect(&mut client, "LISTEN pinchan").await;
+    assert!(
+        matches!(
+            msgs.last(),
+            Some(BackendMessage::ReadyForQuery(TransactionStatus::Idle))
+        ),
+        "LISTEN should complete with ReadyForQuery(Idle): {msgs:?}"
+    );
+    assert!(
+        mock.received_queries()
+            .iter()
+            .any(|q| q.contains("LISTEN pinchan")),
+        "pin mode must forward the LISTEN to the backend"
+    );
+
+    // The pinned backend is still checked out: with max = 1 a second
+    // checkout times out instead of stealing it.
+    let other = test_client_guard();
+    let result = pools.checkout(&other, "testdb", "testuser", false).await;
+    assert!(
+        result.is_err(),
+        "pinned connection must not be handed to another client"
+    );
+
+    // An intercepted DEALLOCATE while pinned-and-idle must advertise the
+    // real server status (Idle), not the optimistic in-transaction default
+    // that only applies before the first ReadyForQuery.
+    let msgs = query_collect(&mut client, "DEALLOCATE bogus").await;
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, BackendMessage::CommandComplete(tag) if tag == "DEALLOCATE")),
+        "DEALLOCATE must be intercepted with a synthetic response: {msgs:?}"
+    );
+    assert!(
+        matches!(
+            msgs.last(),
+            Some(BackendMessage::ReadyForQuery(TransactionStatus::Idle))
+        ),
+        "the synthetic status must mirror the last server status: {msgs:?}"
+    );
+    assert!(
+        !mock
+            .received_queries()
+            .iter()
+            .any(|q| q.to_ascii_uppercase().contains("DEALLOCATE")),
+        "the intercepted DEALLOCATE must not reach the backend"
+    );
+
+    // UNLISTEN * unpins; the following ReadyForQuery(Idle) releases the
+    // backend to the pool, where another client can pick it up.
+    let _ = query_collect(&mut client, "UNLISTEN *").await;
+    wait_for_idle(&pools, 1).await;
+    let guard = pools
+        .checkout(&other, "testdb", "testuser", false)
+        .await
+        .expect("released connection must be checkoutable after UNLISTEN *");
+    drop(guard);
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    handle.await.unwrap().unwrap();
+    mock.stop().await;
+}
+
+/// `LISTEN` arriving mid-transaction (not as the checkout's first message)
+/// must pin through the inner forwarding loop as well: after `COMMIT`
+/// returns the session to idle, the backend stays checked out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pin_mode_listen_mid_transaction_pins_connection() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool_with_config(test_config_max(&mock.addr(), 1), &mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    let _ = query_collect(&mut client, "BEGIN").await;
+    let _ = query_collect(&mut client, "LISTEN midchan").await;
+    let msgs = query_collect(&mut client, "COMMIT").await;
+    assert!(
+        matches!(
+            msgs.last(),
+            Some(BackendMessage::ReadyForQuery(TransactionStatus::Idle))
+        ),
+        "COMMIT should return the session to idle: {msgs:?}"
+    );
+
+    // Still pinned after the transaction completed.
+    let other = test_client_guard();
+    let result = pools.checkout(&other, "testdb", "testuser", false).await;
+    assert!(
+        result.is_err(),
+        "mid-transaction LISTEN must pin the connection past COMMIT"
+    );
+
+    // UNLISTEN * releases it.
+    let _ = query_collect(&mut client, "UNLISTEN *").await;
+    wait_for_idle(&pools, 1).await;
+
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    handle.await.unwrap().unwrap();
+    mock.stop().await;
+}
+
+/// A `LISTEN` carried in an extended-protocol `Parse` also pins: the
+/// classifier reads Parse-carried SQL for routing and pinning, so both
+/// protocols trigger session pinning identically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pin_mode_listen_via_parse_pins_connection() {
+    let mock = MockPg::start(MockBehavior::Ok).await;
+    let (pools, _config) = setup_pool_with_config(test_config_max(&mock.addr(), 1), &mock);
+    let (client_tcp, proxy_tcp) = tcp_pair().await;
+
+    let handle = spawn_tx_forward(proxy_tcp, Arc::clone(&pools), "testdb", "testuser", false);
+    let mut client = Framed::new(client_tcp, BackendCodec::new());
+
+    extended_query(&mut client, "l1", "LISTEN extchan").await;
+
+    // Pinned: the backend survives the batch's ReadyForQuery(Idle).
+    let other = test_client_guard();
+    let result = pools.checkout(&other, "testdb", "testuser", false).await;
+    assert!(
+        result.is_err(),
+        "Parse-carried LISTEN must pin the connection"
+    );
+
+    // Client disconnect returns the pinned connection to the pool.
+    client.send(FrontendMessage::Terminate).await.unwrap();
+    handle.await.unwrap().unwrap();
+    wait_for_idle(&pools, 1).await;
+    mock.stop().await;
 }

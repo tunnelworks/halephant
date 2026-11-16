@@ -278,6 +278,35 @@ fn notification_response() {
 }
 
 // ---------------------------------------------------------------------------
+// Function call and protocol negotiation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn function_call_response() {
+    // Result value length 5 followed by the value bytes.
+    let mut payload = 5i32.to_be_bytes().to_vec();
+    payload.extend_from_slice(b"hello");
+    round_trip(&BackendMessage::FunctionCallResponse(payload));
+}
+
+#[test]
+fn function_call_response_null_result() {
+    // A NULL result is length -1 with no value bytes.
+    round_trip(&BackendMessage::FunctionCallResponse(
+        (-1i32).to_be_bytes().to_vec(),
+    ));
+}
+
+#[test]
+fn negotiate_protocol_version() {
+    // Newest minor version 0, one unsupported option name.
+    let mut payload = 0i32.to_be_bytes().to_vec();
+    payload.extend_from_slice(&1i32.to_be_bytes());
+    payload.extend_from_slice(b"_pq_.unknown\0");
+    round_trip(&BackendMessage::NegotiateProtocolVersion(payload));
+}
+
+// ---------------------------------------------------------------------------
 // Error cases
 // ---------------------------------------------------------------------------
 
@@ -304,5 +333,76 @@ fn truncated_ready_for_query() {
 #[test]
 fn invalid_transaction_status() {
     let err = BackendMessage::parse(b'Z', b"X").unwrap_err();
+    assert!(matches!(err, ProtocolError::InvalidValue { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Hostile input: counts and lengths from the wire must never reach an
+// allocation unchecked (robustness review H1). The backend parsers also run
+// on upstream data, so they need the same guards as the frontend.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn data_row_negative_column_count() {
+    // DataRow with a column count of 0xFFFF (-1 as i16). An unguarded
+    // `as usize` cast turns it into usize::MAX and panics on
+    // `Vec::with_capacity`; the parser must return an error instead.
+    let err = BackendMessage::parse(b'D', &[0xFF, 0xFF]).unwrap_err();
+    assert!(matches!(err, ProtocolError::InvalidValue { .. }));
+}
+
+#[test]
+fn data_row_column_length_exceeds_payload() {
+    // A six-byte DataRow declaring a ~2 GiB column length. The declared
+    // length must be rejected against the remaining payload before any
+    // allocation happens.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&1i16.to_be_bytes()); // one column
+    payload.extend_from_slice(&i32::MAX.to_be_bytes()); // declared length ~2 GiB
+    let err = BackendMessage::parse(b'D', &payload).unwrap_err();
+    assert!(
+        matches!(err, ProtocolError::InvalidValue { .. }) && err.to_string().contains("exceeds"),
+        "expected a declared-length guard error, got: {err}"
+    );
+}
+
+#[test]
+fn data_row_column_count_exceeds_payload() {
+    // A column count far larger than the bytes behind it.
+    let err = BackendMessage::parse(b'D', &i16::MAX.to_be_bytes()).unwrap_err();
+    assert!(
+        matches!(err, ProtocolError::InvalidValue { .. }) && err.to_string().contains("exceeds"),
+        "expected a declared-count guard error, got: {err}"
+    );
+}
+
+#[test]
+fn row_description_negative_field_count() {
+    let err = BackendMessage::parse(b'T', &[0xFF, 0xFF]).unwrap_err();
+    assert!(matches!(err, ProtocolError::InvalidValue { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Hostile input: truncated integers and cstrings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backend_key_data_truncated() {
+    // BackendKeyData with only six of the eight bytes.
+    let err = BackendMessage::parse(b'K', &[0, 0, 0, 1, 0, 0]).unwrap_err();
+    assert!(matches!(err, ProtocolError::InvalidValue { .. }));
+}
+
+#[test]
+fn parameter_status_unterminated_value() {
+    // ParameterStatus whose value is missing the NUL terminator.
+    let err = BackendMessage::parse(b'S', b"server_version\x0016.2").unwrap_err();
+    assert!(matches!(err, ProtocolError::InvalidValue { .. }));
+}
+
+#[test]
+fn notification_truncated_process_id() {
+    // NotificationResponse with only two of the four process-id bytes.
+    let err = BackendMessage::parse(b'A', &[0, 0]).unwrap_err();
     assert!(matches!(err, ProtocolError::InvalidValue { .. }));
 }

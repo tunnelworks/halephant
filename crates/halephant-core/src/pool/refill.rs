@@ -8,8 +8,9 @@ use std::time::Instant;
 use tracing::{Instrument, debug, warn};
 
 use crate::connections::reset::reset_connection;
-use crate::connections::server::{self, ServerConn};
+use crate::connections::server::ServerConn;
 use crate::pool::PoolManager;
+use crate::pool::candidates::ConnectSpec;
 use crate::pool::types::{ConnId, IdleConn, PoolKey};
 
 /// Maximum in-flight connection opens per call to
@@ -194,36 +195,24 @@ impl PoolManager {
             return 0;
         }
 
-        // Resolve the upstream identity once for the batch. Connection
-        // failures from a missing config or user are surfaced via warn,
-        // not by silently returning 0 — that would mask config drift.
+        // Resolve the upstream identity once for the batch through the
+        // resolver shared with checkout — refusal semantics for a
+        // missing database or user are identical on both paths.
+        // Failures are surfaced via warn, not by silently returning 0 —
+        // that would mask config drift.
         let cfg = self.config.load_full();
-        let (upstream_database, upstream_user, params, max_prepared, connect_timeout) = {
-            let Some((_, cluster_config, pool_config)) = cfg.find_pool(&key.database) else {
-                warn!(
-                    database = %key.database,
-                    "refill: database not configured",
-                );
-                return 0;
-            };
-            let Some(user_config) = pool_config.user.get(&key.user) else {
+        let spec = match ConnectSpec::resolve(&cfg, &key.database, &key.user) {
+            Ok(spec) => spec,
+            Err(e) => {
                 warn!(
                     database = %key.database,
                     user = %key.user,
-                    "refill: user not configured",
+                    %e,
+                    "refill: connect identity unresolved",
                 );
                 return 0;
-            };
-            (
-                pool_config.database_name(&key.database).to_owned(),
-                user_config.upstream_name(&key.user).to_owned(),
-                user_config.parameters.clone(),
-                cfg.server.max_prepared_statements,
-                cluster_config.connect_timeout,
-            )
+            }
         };
-
-        let password = self.lookup_password(&key.node, &upstream_database, &upstream_user);
 
         // Cap in-flight opens to the same upstream node. PostgreSQL's
         // postmaster accepts and forks backends serially — slamming it
@@ -241,10 +230,7 @@ impl PoolManager {
         for _ in 0..n {
             let this = Arc::clone(self);
             let key = key.clone();
-            let upstream_database = upstream_database.clone();
-            let upstream_user = upstream_user.clone();
-            let password = password.clone();
-            let params = params.clone();
+            let spec = spec.clone();
             let permits = Arc::clone(&permits);
 
             tasks.spawn(
@@ -255,17 +241,7 @@ impl PoolManager {
                         .acquire_owned()
                         .await
                         .expect("refill semaphore is never closed");
-                    match server::connect_server(
-                        &key.node,
-                        &upstream_database,
-                        &upstream_user,
-                        password.as_deref(),
-                        &params,
-                        max_prepared,
-                        connect_timeout,
-                    )
-                    .await
-                    {
+                    match this.connect_with_spec(&key.node, &spec).await {
                         Ok(conn) => {
                             {
                                 let mut inner = this.inner.lock();

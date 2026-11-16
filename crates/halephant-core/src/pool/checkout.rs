@@ -8,11 +8,14 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 use crate::clients;
-use crate::connections::server;
 use crate::errors::ResolveError;
 use crate::o11y;
 use crate::pool::PoolManager;
-use crate::pool::types::{CandidateResult, ConnGuard, ConnId, PoolKey, Routing, WaitKey, Waiter};
+use crate::pool::candidates::ConnectSpec;
+use crate::pool::types::{
+    CandidateResult, CheckoutError, ConnGuard, ConnId, PoolKey, Routing, WaitKey, Waiter,
+    classify_checkout_error,
+};
 
 impl PoolManager {
     #[tracing::instrument(name = "pool.checkout", skip_all, err(Display), fields(
@@ -43,49 +46,33 @@ impl PoolManager {
         };
 
         let cfg = self.config.load_full();
-        let max_prepared_statements = cfg.server.max_prepared_statements;
-
-        let (
-            cluster_name,
-            connect_timeout,
-            idle_timeout,
-            max_lifetime,
-            checkout_timeout,
-            upstream_database,
-        ) = {
-            let Some((name, cluster, pool_config)) = cfg.find_pool(database) else {
-                return Err(ResolveError::UnknownDatabase {
-                    database: database.to_owned(),
-                }
-                .into());
-            };
-            (
-                name.to_owned(),
-                cluster.connect_timeout,
-                pool_config.idle_timeout,
-                pool_config.max_lifetime,
-                pool_config
-                    .checkout_timeout
-                    .unwrap_or(cfg.server.checkout_timeout),
-                pool_config.database_name(database).to_owned(),
-            )
-        };
-
-        let (upstream_user, user_params) = {
-            let user_config = cfg.find_user(database, user);
-            let upstream_user = user_config
-                .map_or(user, |u| u.upstream_name(user))
-                .to_owned();
-            let params = user_config
-                .map(|u| u.parameters.clone())
-                .unwrap_or_default();
-            (upstream_user, params)
-        };
-
         let checkout_start = Instant::now();
         let mut queue_start: Option<Instant> = None;
 
         async {
+            let (cluster_name, idle_timeout, max_lifetime, checkout_timeout) = {
+                let Some((name, _, pool_config)) = cfg.find_pool(database) else {
+                    return Err(ResolveError::UnknownDatabase {
+                        database: database.to_owned(),
+                    }
+                    .into());
+                };
+                (
+                    name.to_owned(),
+                    pool_config.idle_timeout,
+                    pool_config.max_lifetime,
+                    pool_config
+                        .checkout_timeout
+                        .unwrap_or(cfg.server.checkout_timeout),
+                )
+            };
+
+            // One resolver owns the upstream connect identity, shared
+            // with refill. An unconfigured user is refused here —
+            // matching the frontend's `is_user_allowed` gate — never
+            // silently mapped to the client-facing name.
+            let spec = ConnectSpec::resolve(&cfg, database, user)?;
+
             loop {
                 // Build candidate lists: primary target first, then
                 // primary as fallback for read-only traffic.
@@ -138,19 +125,7 @@ impl PoolManager {
                         });
                     }
                     CandidateResult::Claimed { key, id } => {
-                        let password =
-                            self.lookup_password(&key.node, &upstream_database, &upstream_user);
-                        match server::connect_server(
-                            &key.node,
-                            &upstream_database,
-                            &upstream_user,
-                            password.as_deref(),
-                            &user_params,
-                            max_prepared_statements,
-                            connect_timeout,
-                        )
-                        .await
-                        {
+                        match self.connect_with_spec(&key.node, &spec).await {
                             Ok(conn) => {
                                 record_checkout_success(
                                     &key,
@@ -206,25 +181,26 @@ impl PoolManager {
                 client.set_state(clients::ClientState::Waiting);
                 queue_start.get_or_insert_with(Instant::now);
 
+                let timeout_error = || CheckoutError::Timeout {
+                    timeout: checkout_timeout,
+                    database: database.to_owned(),
+                    user: user.to_owned(),
+                };
                 let remaining = checkout_timeout.saturating_sub(checkout_start.elapsed());
                 if remaining.is_zero() {
                     client.set_waiting_for(None);
                     client.set_state(clients::ClientState::Idle);
-                    anyhow::bail!(
-                        "checkout timed out after {checkout_timeout:?} for {database}/{user}",
-                    );
+                    return Err(timeout_error().into());
                 }
                 let wake = tokio::time::timeout(remaining, rx).await;
                 client.set_waiting_for(None);
                 client.set_state(clients::ClientState::Idle);
 
                 if wake.is_err() {
-                    anyhow::bail!(
-                        "checkout timed out after {checkout_timeout:?} for {database}/{user}",
-                    );
+                    return Err(timeout_error().into());
                 }
                 if self.shutting_down.load(Ordering::Acquire) {
-                    anyhow::bail!("halephant is shutting down");
+                    return Err(CheckoutError::ShuttingDown.into());
                 }
             }
         }
@@ -233,21 +209,7 @@ impl PoolManager {
             tracing::Span::current().record("otel.status_code", "OK");
         })
         .inspect_err(|e| {
-            let msg = e.to_string();
-            let error_type = if let Some(resolve_err) = e.downcast_ref::<ResolveError>() {
-                match resolve_err {
-                    ResolveError::UnknownDatabase { .. } => "unknown_database",
-                    ResolveError::NoPrimary { .. } => "no_primary",
-                    ResolveError::NoReplica { .. } => "no_replica",
-                }
-            } else if msg.contains("shutting down") {
-                "shutting_down"
-            } else if msg.contains("checkout timed out") {
-                "checkout_timeout"
-            } else {
-                "connect_failed"
-            };
-            o11y::metrics::record_checkout_error(database, user, error_type);
+            o11y::metrics::record_checkout_error(database, user, classify_checkout_error(e));
             let span = tracing::Span::current();
             span.record("otel.status_code", "ERROR");
             span.record("otel.status_description", "checkout failed");

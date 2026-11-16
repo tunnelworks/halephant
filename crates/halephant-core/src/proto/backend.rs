@@ -1,11 +1,8 @@
 use bytes::{BufMut, BytesMut};
-use chumsky::prelude::*;
-use chumsky::span::SimpleSpan;
 
 use crate::errors;
 use crate::proto::coding;
-use crate::proto::parser;
-use crate::proto::primitives;
+use crate::proto::cursor::{self, Cursor};
 use crate::proto::types;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +54,12 @@ pub enum BackendMessage {
 
     // -- Async notifications --
     NotificationResponse(Notification),
+
+    // -- Function call --
+    FunctionCallResponse(Vec<u8>),
+
+    // -- Protocol negotiation --
+    NegotiateProtocolVersion(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,79 +118,76 @@ impl NoticeFields {
 }
 
 // ---------------------------------------------------------------------------
-// Chumsky parsers
+// Decoding
 // ---------------------------------------------------------------------------
 
-fn authentication<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>> {
-    custom(|inp| {
-        let auth_type: i32 = inp.parse(primitives::pg_int32())?;
-        match auth_type {
-            0 => Ok(BackendMessage::AuthenticationOk),
-            3 => Ok(BackendMessage::AuthenticationCleartextPassword),
-            5 => {
-                let salt = [
-                    inp.parse(any())?,
-                    inp.parse(any())?,
-                    inp.parse(any())?,
-                    inp.parse(any())?,
-                ];
-                Ok(BackendMessage::AuthenticationMd5Password { salt })
-            }
-            10 => {
-                let mut mechanisms = Vec::new();
-                loop {
-                    let mech: String = inp.parse(primitives::pg_cstring())?;
-                    if mech.is_empty() {
-                        break;
-                    }
-                    mechanisms.push(mech);
-                }
-                Ok(BackendMessage::AuthenticationSasl { mechanisms })
-            }
-            11 => {
-                let data = inp.parse(any().repeated().collect::<Vec<u8>>())?;
-                Ok(BackendMessage::AuthenticationSaslContinue { data })
-            }
-            12 => {
-                let data = inp.parse(any().repeated().collect::<Vec<u8>>())?;
-                Ok(BackendMessage::AuthenticationSaslFinal { data })
-            }
-            _ => Err(Rich::custom(
-                SimpleSpan::new(0, 4),
-                format!("unknown authentication type: {auth_type}"),
-            )),
+fn decode_authentication(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    // The authentication type field starts at payload offset zero, so
+    // the unknown-type error reports position 0.
+    let auth_type = cur.read_i32()?;
+    match auth_type {
+        0 => Ok(BackendMessage::AuthenticationOk),
+        3 => Ok(BackendMessage::AuthenticationCleartextPassword),
+        5 => {
+            let salt = [
+                cur.read_u8()?,
+                cur.read_u8()?,
+                cur.read_u8()?,
+                cur.read_u8()?,
+            ];
+            Ok(BackendMessage::AuthenticationMd5Password { salt })
         }
+        10 => {
+            let mut mechanisms = Vec::new();
+            loop {
+                let mech = cur.read_cstring()?;
+                if mech.is_empty() {
+                    break;
+                }
+                mechanisms.push(mech);
+            }
+            Ok(BackendMessage::AuthenticationSasl { mechanisms })
+        }
+        11 => Ok(BackendMessage::AuthenticationSaslContinue {
+            data: cur.take_rest().to_vec(),
+        }),
+        12 => Ok(BackendMessage::AuthenticationSaslFinal {
+            data: cur.take_rest().to_vec(),
+        }),
+        _ => Err(errors::ProtocolError::InvalidValue {
+            position: 0,
+            message: format!("unknown authentication type: {auth_type}"),
+        }),
+    }
+}
+
+fn decode_backend_key_data(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    let process_id = cur.read_i32()?;
+    let secret_key = cur.read_i32()?;
+    Ok(BackendMessage::BackendKeyData {
+        process_id,
+        secret_key,
     })
 }
 
-fn backend_key_data<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>>
-{
-    primitives::pg_int32()
-        .then(primitives::pg_int32())
-        .map(|(process_id, secret_key)| BackendMessage::BackendKeyData {
-            process_id,
-            secret_key,
-        })
+fn decode_command_complete(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    Ok(BackendMessage::CommandComplete(cur.read_cstring()?))
 }
 
-fn command_complete<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>>
-{
-    primitives::pg_cstring().map(BackendMessage::CommandComplete)
+fn decode_data_row(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    let columns = cur.read_count_prefixed(Cursor::read_nullable_bytes)?;
+    Ok(BackendMessage::DataRow(columns))
 }
 
-fn data_row<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>> {
-    primitives::pg_count_prefixed(primitives::pg_nullable_bytes()).map(BackendMessage::DataRow)
-}
-
-fn row_description<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>> {
-    primitives::pg_count_prefixed(custom(|inp| {
-        let name = inp.parse(primitives::pg_cstring())?;
-        let table_oid = inp.parse(primitives::pg_int32())? as u32;
-        let column_id = inp.parse(primitives::pg_int16())?;
-        let type_oid = inp.parse(primitives::pg_int32())? as u32;
-        let type_size = inp.parse(primitives::pg_int16())?;
-        let type_modifier = inp.parse(primitives::pg_int32())?;
-        let format = inp.parse(primitives::pg_format_code())?;
+fn decode_row_description(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    let fields = cur.read_count_prefixed(|cur| {
+        let name = cur.read_cstring()?;
+        let table_oid = cur.read_i32()? as u32;
+        let column_id = cur.read_i16()?;
+        let type_oid = cur.read_i32()? as u32;
+        let type_size = cur.read_i16()?;
+        let type_modifier = cur.read_i32()?;
+        let format = cur.read_format_code()?;
         Ok(FieldDescription {
             name,
             table_oid,
@@ -197,80 +197,82 @@ fn row_description<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, pars
             type_modifier,
             format,
         })
-    }))
-    .map(BackendMessage::RowDescription)
+    })?;
+    Ok(BackendMessage::RowDescription(fields))
 }
 
-fn parameter_status<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>>
-{
-    primitives::pg_cstring()
-        .then(primitives::pg_cstring())
-        .map(|(name, value)| BackendMessage::ParameterStatus { name, value })
+fn decode_parameter_status(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    let name = cur.read_cstring()?;
+    let value = cur.read_cstring()?;
+    Ok(BackendMessage::ParameterStatus { name, value })
 }
 
-fn parameter_description<'src>()
--> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>> {
-    primitives::pg_count_prefixed(primitives::pg_int32().map(|v| v as u32))
-        .map(BackendMessage::ParameterDescription)
+fn decode_parameter_description(
+    cur: &mut Cursor<'_>,
+) -> Result<BackendMessage, errors::ProtocolError> {
+    let oids = cur.read_count_prefixed(|cur| Ok(cur.read_i32()? as u32))?;
+    Ok(BackendMessage::ParameterDescription(oids))
 }
 
-fn ready_for_query<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>> {
-    any()
-        .try_map(|b, span| match b {
-            b'I' => Ok(types::TransactionStatus::Idle),
-            b'T' => Ok(types::TransactionStatus::InTransaction),
-            b'E' => Ok(types::TransactionStatus::Failed),
-            _ => Err(Rich::custom(
-                span,
-                format!("unknown transaction status: {b:#04x}"),
-            )),
-        })
-        .map(BackendMessage::ReadyForQuery)
-}
-
-fn notification<'src>() -> impl Parser<'src, &'src [u8], BackendMessage, parser::PgExtra<'src>> {
-    primitives::pg_int32()
-        .then(primitives::pg_cstring())
-        .then(primitives::pg_cstring())
-        .map(|((process_id, channel), payload)| {
-            BackendMessage::NotificationResponse(Notification {
-                process_id,
-                channel,
-                payload,
-            })
-        })
-}
-
-fn notice_fields<'src>() -> impl Parser<'src, &'src [u8], NoticeFields, parser::PgExtra<'src>> {
-    custom(|inp| {
-        let mut fields = Vec::new();
-        loop {
-            let tag: u8 = inp.parse(any())?;
-            if tag == 0 {
-                break;
-            }
-            let value: String = inp.parse(primitives::pg_cstring())?;
-            fields.push((tag, value));
+fn decode_ready_for_query(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    let start = cur.position();
+    let status = match cur.read_u8()? {
+        b'I' => types::TransactionStatus::Idle,
+        b'T' => types::TransactionStatus::InTransaction,
+        b'E' => types::TransactionStatus::Failed,
+        b => {
+            return Err(errors::ProtocolError::InvalidValue {
+                position: start,
+                message: format!("unknown transaction status: {b:#04x}"),
+            });
         }
-        Ok(NoticeFields { fields })
-    })
+    };
+    Ok(BackendMessage::ReadyForQuery(status))
 }
 
-fn copy_response<'src>() -> impl Parser<'src, &'src [u8], CopyResponse, parser::PgExtra<'src>> {
-    any()
-        .try_map(|b, span| match b {
-            0 => Ok(types::FormatCode::Text),
-            1 => Ok(types::FormatCode::Binary),
-            _ => Err(Rich::custom(
-                span,
-                format!("invalid overall format code: {b}"),
-            )),
-        })
-        .then(primitives::pg_count_prefixed(primitives::pg_format_code()))
-        .map(|(format, column_formats)| CopyResponse {
-            format,
-            column_formats,
-        })
+fn decode_notification(cur: &mut Cursor<'_>) -> Result<BackendMessage, errors::ProtocolError> {
+    let process_id = cur.read_i32()?;
+    let channel = cur.read_cstring()?;
+    let payload = cur.read_cstring()?;
+    Ok(BackendMessage::NotificationResponse(Notification {
+        process_id,
+        channel,
+        payload,
+    }))
+}
+
+fn decode_notice_fields(cur: &mut Cursor<'_>) -> Result<NoticeFields, errors::ProtocolError> {
+    let mut fields = Vec::new();
+    loop {
+        let tag = cur.read_u8()?;
+        if tag == 0 {
+            break;
+        }
+        let value = cur.read_cstring()?;
+        fields.push((tag, value));
+    }
+    Ok(NoticeFields { fields })
+}
+
+fn decode_copy_response(cur: &mut Cursor<'_>) -> Result<CopyResponse, errors::ProtocolError> {
+    // The overall format is a single raw byte (0 or 1), unlike the
+    // per-column format codes, which are 16-bit integers.
+    let start = cur.position();
+    let format = match cur.read_u8()? {
+        0 => types::FormatCode::Text,
+        1 => types::FormatCode::Binary,
+        b => {
+            return Err(errors::ProtocolError::InvalidValue {
+                position: start,
+                message: format!("invalid overall format code: {b}"),
+            });
+        }
+    };
+    let column_formats = cur.read_count_prefixed(Cursor::read_format_code)?;
+    Ok(CopyResponse {
+        format,
+        column_formats,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -287,31 +289,37 @@ impl BackendMessage {
             b'1' => Ok(BackendMessage::ParseComplete),
             b'2' => Ok(BackendMessage::BindComplete),
             b'3' => Ok(BackendMessage::CloseComplete),
-            b'A' => parser::run(notification(), payload),
-            b'C' => parser::run(command_complete(), payload),
+            b'A' => cursor::run(payload, decode_notification),
+            b'C' => cursor::run(payload, decode_command_complete),
             b'c' => Ok(BackendMessage::CopyDone),
             b'd' => Ok(BackendMessage::CopyData(payload.to_vec())),
-            b'D' => parser::run(data_row(), payload),
-            b'E' => parser::run(notice_fields().map(BackendMessage::ErrorResponse), payload),
-            b'G' => parser::run(copy_response().map(BackendMessage::CopyInResponse), payload),
-            b'H' => parser::run(
-                copy_response().map(BackendMessage::CopyOutResponse),
-                payload,
-            ),
+            b'D' => cursor::run(payload, decode_data_row),
+            b'E' => cursor::run(payload, |cur| {
+                decode_notice_fields(cur).map(BackendMessage::ErrorResponse)
+            }),
+            b'G' => cursor::run(payload, |cur| {
+                decode_copy_response(cur).map(BackendMessage::CopyInResponse)
+            }),
+            b'H' => cursor::run(payload, |cur| {
+                decode_copy_response(cur).map(BackendMessage::CopyOutResponse)
+            }),
             b'I' => Ok(BackendMessage::EmptyQueryResponse),
-            b'K' => parser::run(backend_key_data(), payload),
+            b'K' => cursor::run(payload, decode_backend_key_data),
             b'n' => Ok(BackendMessage::NoData),
-            b'N' => parser::run(notice_fields().map(BackendMessage::NoticeResponse), payload),
-            b'R' => parser::run(authentication(), payload),
+            b'N' => cursor::run(payload, |cur| {
+                decode_notice_fields(cur).map(BackendMessage::NoticeResponse)
+            }),
+            b'R' => cursor::run(payload, decode_authentication),
             b's' => Ok(BackendMessage::PortalSuspended),
-            b'S' => parser::run(parameter_status(), payload),
-            b't' => parser::run(parameter_description(), payload),
-            b'T' => parser::run(row_description(), payload),
-            b'W' => parser::run(
-                copy_response().map(BackendMessage::CopyBothResponse),
-                payload,
-            ),
-            b'Z' => parser::run(ready_for_query(), payload),
+            b'S' => cursor::run(payload, decode_parameter_status),
+            b't' => cursor::run(payload, decode_parameter_description),
+            b'T' => cursor::run(payload, decode_row_description),
+            b'v' => Ok(BackendMessage::NegotiateProtocolVersion(payload.to_vec())),
+            b'V' => Ok(BackendMessage::FunctionCallResponse(payload.to_vec())),
+            b'W' => cursor::run(payload, |cur| {
+                decode_copy_response(cur).map(BackendMessage::CopyBothResponse)
+            }),
+            b'Z' => cursor::run(payload, decode_ready_for_query),
             _ => Err(errors::ProtocolError::UnknownMessageType(msg_type)),
         }
     }
@@ -452,6 +460,18 @@ impl BackendMessage {
                 coding::encode_cstring(dst, &n.channel);
                 coding::encode_cstring(dst, &n.payload);
             }),
+
+            BackendMessage::FunctionCallResponse(data) => {
+                coding::encode_message(dst, b'V', |dst| {
+                    dst.extend_from_slice(data);
+                });
+            }
+
+            BackendMessage::NegotiateProtocolVersion(data) => {
+                coding::encode_message(dst, b'v', |dst| {
+                    dst.extend_from_slice(data);
+                });
+            }
         }
     }
 }

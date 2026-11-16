@@ -35,22 +35,20 @@ use crate::sql;
 /// - `server.statements` — canonical names of prepared statements
 ///   registered on this backend via `ensure_prepared`.
 ///
-/// Only tracks the simple query protocol (Query messages) — a SET
+/// `stmt` is the caller's one-per-message classification, and callers
+/// only pass classifications of simple-protocol Query messages — a SET
 /// inside a Parse is not tracked because it hasn't been executed yet.
-fn track_set_reset(msg: &proto::frontend::FrontendMessage, server: &mut ServerConn) {
-    let proto::frontend::FrontendMessage::Query(query) = msg else {
-        return;
-    };
+fn track_set_reset(stmt: &sql::Statement, server: &mut ServerConn) {
     // SET LOCAL falls into the wildcard arm below: its effect is
     // transaction-scoped and unwound automatically on COMMIT/ROLLBACK,
     // so there's nothing to track in dirty_vars.
-    match sql::parse(query) {
+    match stmt {
         sql::Statement::Set {
             scope: sql::SetScope::Session,
             parameter,
             ..
         } => {
-            server.dirty_vars.insert(parameter);
+            server.dirty_vars.insert(parameter.clone());
         }
         sql::Statement::Reset {
             target: sql::ResetTarget::All,
@@ -60,7 +58,7 @@ fn track_set_reset(msg: &proto::frontend::FrontendMessage, server: &mut ServerCo
         sql::Statement::Reset {
             target: sql::ResetTarget::Parameter(name),
         } => {
-            server.dirty_vars.remove(&name);
+            server.dirty_vars.remove(name);
         }
         sql::Statement::Discard {
             target: sql::DiscardTarget::All,
@@ -130,7 +128,7 @@ async fn forward_loop(
 ) -> anyhow::Result<()> {
     loop {
         // Idle — wait for the client to send something (or a notification).
-        let first_msg = loop {
+        let (first_msg, first_stmt) = loop {
             tokio::select! {
                 msg = client.next() => match msg.transpose()? {
                     Some(proto::frontend::FrontendMessage::Terminate) => {
@@ -138,6 +136,18 @@ async fn forward_loop(
                         return Ok(());
                     }
                     Some(msg) => {
+                        // Classify the SQL body once — every intercept and
+                        // routing decision on this message reads this
+                        // single classification.
+                        let stmt = classify(&msg);
+                        // Interceptors act only on simple-protocol Query
+                        // statements: a Parse-carried statement is being
+                        // prepared, not executed, and a synthetic
+                        // simple-query response would desynchronize the
+                        // extended-protocol reply stream.
+                        let simple_query =
+                            matches!(msg, proto::frontend::FrontendMessage::Query(_));
+
                         // We're in the outer idle loop with no server
                         // connection checked out — by definition the
                         // session has no active transaction, so any
@@ -147,16 +157,16 @@ async fn forward_loop(
 
                         // In multiplex mode, intercept LISTEN/UNLISTEN in idle state
                         // (no server connection needed).
-                        if listen_mode == ListenMode::Multiplex
-                            && let Some(true) =
-                                handle_listen_intercept(&msg, notifications, client, idle).await?
+                        if simple_query
+                            && listen_mode == ListenMode::Multiplex
+                            && handle_listen_intercept(&stmt, notifications, client, idle).await?
                         {
                             continue; // stay idle
                         }
 
                         // Intercept Close for named statements — return synthetic
                         // CloseComplete without needing a server connection.
-                        if let Some(true) = handle_close_intercept(&msg, client_prepared, client, pools).await? {
+                        if handle_close_intercept(&msg, client_prepared, client, pools).await? {
                             continue; // stay idle
                         }
 
@@ -164,11 +174,13 @@ async fn forward_loop(
                         // reason — halephant renames client Parse names
                         // to canonical hashes, so a raw DEALLOCATE
                         // would not find the statement on the server.
-                        if let Some(true) = handle_deallocate_intercept(&msg, client_prepared, client, pools, idle).await? {
+                        if simple_query
+                            && handle_deallocate_intercept(&stmt, client_prepared, client, pools, idle).await?
+                        {
                             continue; // stay idle
                         }
 
-                        break msg;
+                        break (msg, stmt);
                     }
                     None => return Ok(()),
                 },
@@ -179,7 +191,7 @@ async fn forward_loop(
         };
 
         // Reject read-write overrides on read-only sessions.
-        if read_only && is_read_write_override_msg(&first_msg) {
+        if read_only && first_stmt.is_read_write_override() {
             reject_read_write(client, proto::types::TransactionStatus::Idle).await?;
             continue;
         }
@@ -187,7 +199,7 @@ async fn forward_loop(
         // Determine routing for this transaction. If the first message is
         // BEGIN READ ONLY (or START TRANSACTION READ ONLY), route to a replica
         // even if the session isn't globally read-only.
-        let txn_read_only = read_only || is_read_only_query(&first_msg);
+        let txn_read_only = read_only || is_read_only_begin(&first_stmt);
 
         let txn_span = info_span!(
             "proxy.transaction",
@@ -221,7 +233,7 @@ async fn forward_loop(
 
                 // In pin mode, check if the first message is LISTEN — pin immediately.
                 let mut pinned = false;
-                if matches!(classify(&first_msg), sql::Statement::Listen { .. }) {
+                if matches!(first_stmt, sql::Statement::Listen { .. }) {
                     pinned = listen_mode == ListenMode::Pin;
                 }
                 if pinned {
@@ -239,7 +251,12 @@ async fn forward_loop(
                 tracker.on_client_msg(&first_msg, |name| {
                     resolve_stmt_query(name, client_prepared, pools)
                 });
-                track_set_reset(&first_msg, guard.conn());
+                // Only a simple-protocol Query executes immediately — a
+                // SET carried in a Parse hasn't run yet — so only Query
+                // classifications feed the SET tracker.
+                if matches!(first_msg, proto::frontend::FrontendMessage::Query(_)) {
+                    track_set_reset(&first_stmt, guard.conn());
+                }
                 // Derive the batch boundary from what actually reaches the
                 // backend, not the raw message: if `rewrite_outbound`
                 // suppresses the `Sync` (returns `None`), no `ReadyForQuery`
@@ -336,24 +353,26 @@ async fn forward_until_idle(
     // this (about-to-be-checked-in) backend would strand their responses
     // when this batch's `ReadyForQuery(Idle)` returns us to the pool.
     let mut awaiting_ready = awaiting_ready;
-    // Whether a real `ReadyForQuery(InTransaction|Failed)` has confirmed we
-    // are inside an explicit `BEGIN`…`COMMIT`. While held that way the
-    // backend is ours until the transaction ends, so cross-`Sync` read-ahead
-    // is safe and the gate is skipped to keep intra-transaction pipelining.
-    // It must start `false` (not derive from `last_server_status`, whose
-    // optimistic `InTransaction` default below would wrongly relax the gate
-    // and let the first autocommit batch be read past).
-    let mut in_explicit_txn = false;
-    // Track the most recent transaction status from the server so
-    // synthetic responses for intercepted client messages reflect
-    // the actual session state. The default is `InTransaction`
-    // because we entered this function after sending the first
-    // message of a new transaction — even if no server response has
-    // arrived yet (the client may have pipelined a BEGIN + LISTEN),
-    // the expected post-first-message state is in-transaction. The
-    // server's eventual ReadyForQuery overwrites this with the real
-    // status, including `InFailedTransaction` when applicable.
-    let mut last_server_status = proto::types::TransactionStatus::InTransaction;
+    // The transaction status carried by the most recent `ReadyForQuery`
+    // from this backend, or `None` before the first one arrives this
+    // checkout. Both transaction-scoped decisions below derive from it:
+    //
+    // - The `Sync` gate stays engaged unless `is_some_and(|s| s != Idle)`:
+    //   a real `ReadyForQuery(InTransaction | Failed)` confirms an explicit
+    //   `BEGIN`…`COMMIT` holds this backend until the transaction ends, so
+    //   cross-`Sync` read-ahead is safe and the gate is skipped to keep
+    //   intra-transaction pipelining. `None` must not relax the gate:
+    //   before any `ReadyForQuery` the session may be autocommit, and
+    //   reading past the first batch's `Sync` would strand the next
+    //   batch's responses.
+    // - Synthetic responses for intercepted client messages advertise
+    //   `unwrap_or(InTransaction)`: we entered this function after sending
+    //   the first message of a new transaction — even if no server
+    //   response has arrived yet (the client may have pipelined a
+    //   BEGIN + LISTEN), the expected post-first-message state is
+    //   in-transaction. The server's eventual `ReadyForQuery` replaces
+    //   the default with the real status, including `Failed`.
+    let mut last_rfq: Option<proto::types::TransactionStatus> = None;
 
     loop {
         tokio::select! {
@@ -363,13 +382,24 @@ async fn forward_until_idle(
                     return Ok(Release::ClientDone);
                 }
                 Some(msg) => {
+                    // Classify the SQL body once — every intercept, routing,
+                    // pinning, and tracking decision on this message reads
+                    // this single classification.
+                    let stmt = classify(&msg);
+                    // Interceptors and the SET tracker act only on
+                    // simple-protocol Query statements: a Parse-carried
+                    // statement is being prepared, not executed, so it must
+                    // reach the backend verbatim.
+                    let simple_query = matches!(msg, proto::frontend::FrontendMessage::Query(_));
+
                     // Multiplex: intercept LISTEN/UNLISTEN even mid-transaction.
-                    if listen_mode == ListenMode::Multiplex
-                        && let Some(true) = handle_listen_intercept(
-                            &msg,
+                    if simple_query
+                        && listen_mode == ListenMode::Multiplex
+                        && handle_listen_intercept(
+                            &stmt,
                             notifications,
                             client,
-                            last_server_status,
+                            last_rfq.unwrap_or(proto::types::TransactionStatus::InTransaction),
                         )
                         .await?
                     {
@@ -377,32 +407,33 @@ async fn forward_until_idle(
                     }
 
                     // Reject read-write overrides on read-only transactions.
-                    if txn_read_only && is_read_write_override_msg(&msg) {
+                    if txn_read_only && stmt.is_read_write_override() {
                         reject_read_write(client, proto::types::TransactionStatus::InTransaction).await?;
                         continue;
                     }
 
                     // Intercept Close for named statements.
-                    if let Some(true) = handle_close_intercept(&msg, client_prepared, client, pools).await? {
+                    if handle_close_intercept(&msg, client_prepared, client, pools).await? {
                         continue;
                     }
 
                     // Intercept DEALLOCATE queries.
-                    if let Some(true) = handle_deallocate_intercept(
-                        &msg,
-                        client_prepared,
-                        client,
-                        pools,
-                        last_server_status,
-                    )
-                    .await?
+                    if simple_query
+                        && handle_deallocate_intercept(
+                            &stmt,
+                            client_prepared,
+                            client,
+                            pools,
+                            last_rfq.unwrap_or(proto::types::TransactionStatus::InTransaction),
+                        )
+                        .await?
                     {
                         continue;
                     }
 
                     // Pin mode: detect LISTEN/UNLISTEN for pinning.
                     if listen_mode == ListenMode::Pin {
-                        match classify(&msg) {
+                        match &stmt {
                             sql::Statement::Listen { .. } if !*pinned => {
                                 warn!("LISTEN detected, pinning connection to session mode");
                                 *pinned = true;
@@ -420,8 +451,11 @@ async fn forward_until_idle(
                     // Record statement span before rewriting.
                     tracker.on_client_msg(&msg, |name| resolve_stmt_query(name, client_prepared, pools));
 
-                    // Track SET/RESET and rewrite prepared statement names.
-                    track_set_reset(&msg, server);
+                    // Track SET/RESET (simple protocol only — a Parse-carried
+                    // SET hasn't executed) and rewrite prepared statement names.
+                    if simple_query {
+                        track_set_reset(&stmt, server);
+                    }
                     if let Some(msg) = rewrite_outbound(msg, client_prepared, server, pools, client).await? {
                         // A `Sync` ends the current extended-protocol batch.
                         // In autocommit the next `ReadyForQuery(Idle)` checks
@@ -430,6 +464,8 @@ async fn forward_until_idle(
                         // is read ahead onto this backend and stranded. Inside
                         // an explicit transaction the backend is held to
                         // COMMIT, so read-ahead is safe and the gate is skipped.
+                        let in_explicit_txn = last_rfq
+                            .is_some_and(|s| s != proto::types::TransactionStatus::Idle);
                         if matches!(msg, proto::frontend::FrontendMessage::Sync)
                             && !in_explicit_txn
                         {
@@ -445,10 +481,7 @@ async fn forward_until_idle(
                 Some(proto::backend::BackendMessage::ReadyForQuery(status)) => {
                     // The batch's boundary arrived — resume reading the client.
                     awaiting_ready = false;
-                    // A non-`Idle` status means we're held inside an explicit
-                    // transaction, where the gate above can be relaxed.
-                    in_explicit_txn = status != proto::types::TransactionStatus::Idle;
-                    last_server_status = status;
+                    last_rfq = Some(status);
                     server.last_tx_status = status;
                     tracker.drain();
                     client.send(proto::backend::BackendMessage::ReadyForQuery(status)).await?;
@@ -559,21 +592,16 @@ fn classify(msg: &proto::frontend::FrontendMessage) -> sql::Statement {
     }
 }
 
-/// Check if a message is a `BEGIN READ ONLY` (or `START TRANSACTION READ ONLY`).
-fn is_read_only_query(msg: &proto::frontend::FrontendMessage) -> bool {
+/// Check if a statement is a `BEGIN READ ONLY` (or `START TRANSACTION READ ONLY`).
+fn is_read_only_begin(stmt: &sql::Statement) -> bool {
     matches!(
-        classify(msg),
+        stmt,
         sql::Statement::Begin {
             options: sql::TransactionOptions {
                 read_only: Some(true),
             },
         }
     )
-}
-
-/// Check if a message attempts to switch to read-write mode.
-fn is_read_write_override_msg(msg: &proto::frontend::FrontendMessage) -> bool {
-    classify(msg).is_read_write_override()
 }
 
 /// Send an error to the client rejecting a read-write override on a

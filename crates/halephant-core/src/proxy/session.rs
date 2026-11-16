@@ -13,6 +13,7 @@ use crate::proto::frontend::FrontendMessage;
 use crate::proto::types::TransactionStatus;
 use crate::proxy::intercept::{handle_close_intercept, handle_deallocate_intercept};
 use crate::proxy::prepared::{ClientPrepared, PreparedGuard, rewrite_outbound};
+use crate::sql;
 
 /// Forward messages between client and server for the lifetime of the session.
 ///
@@ -66,23 +67,27 @@ async fn forward_loop(
                     // Absorb statement Close: drop the per-client mapping
                     // but never forward to the backend — the canonical may
                     // still be needed by another session.
-                    if let Some(true) =
-                        handle_close_intercept(&msg, client_prepared, client, pools).await?
-                    {
+                    if handle_close_intercept(&msg, client_prepared, client, pools).await? {
                         continue;
                     }
                     // Absorb DEALLOCATE for the same reason: the backend
-                    // only knows canonical names, never the client's.
-                    if let Some(true) = handle_deallocate_intercept(
-                        &msg,
-                        client_prepared,
-                        client,
-                        pools,
-                        last_status,
-                    )
-                    .await?
-                    {
-                        continue;
+                    // only knows canonical names, never the client's. The
+                    // SQL body is classified once here, and only for the
+                    // simple query protocol — a Parse-carried DEALLOCATE
+                    // is prepared, not executed, and is forwarded.
+                    if let FrontendMessage::Query(query) = &msg {
+                        let stmt = sql::parse(query);
+                        if handle_deallocate_intercept(
+                            &stmt,
+                            client_prepared,
+                            client,
+                            pools,
+                            last_status,
+                        )
+                        .await?
+                        {
+                            continue;
+                        }
                     }
                     // Rewrite prepared-statement names to canonicals (and
                     // re-Parse on cache miss) before forwarding.

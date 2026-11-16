@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)]
-use bytes::BytesMut;
-use tokio_util::codec::Decoder;
+use bytes::{BufMut, BytesMut};
+use tokio_util::codec::{Decoder, Encoder};
 
 use halephant_core::proto::backend::BackendMessage;
 use halephant_core::proto::codec::{BackendCodec, FrontendCodec};
@@ -170,6 +170,66 @@ fn backend_codec_returns_none_on_empty() {
     let mut codec = BackendCodec::new();
     let mut buf = BytesMut::new();
     assert!(codec.decode(&mut buf).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Relay round trips — decode with one codec, re-encode with the other, the
+// way the proxy forwards messages between client and server.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn function_call_relay_round_trip() {
+    // Client → proxy → server: FunctionCall ('F') decodes on the frontend
+    // codec and re-encodes byte-identically toward the server.
+    let mut client_wire = BytesMut::new();
+    FrontendMessage::FunctionCall(vec![0, 0, 0, 42, 0, 0, 0, 0, 0, 0]).encode(&mut client_wire);
+    let client_original = client_wire.clone();
+
+    let mut frontend = FrontendCodec::post_startup();
+    let mut backend = BackendCodec::new();
+
+    let call = frontend.decode(&mut client_wire).unwrap().unwrap();
+    assert!(matches!(call, FrontendMessage::FunctionCall(_)));
+
+    let mut server_wire = BytesMut::new();
+    backend.encode(call, &mut server_wire).unwrap();
+    assert_eq!(client_original, server_wire);
+
+    // Server → proxy → client: the legal FunctionCallResponse ('V') reply
+    // decodes on the backend codec instead of killing the session, and
+    // re-encodes byte-identically toward the client.
+    let mut reply_wire = BytesMut::new();
+    reply_wire.put_u8(b'V');
+    reply_wire.put_i32(4 + 4 + 5); // length: itself + result length + result
+    reply_wire.put_i32(5); // result value length
+    reply_wire.extend_from_slice(b"hello");
+    let reply_original = reply_wire.clone();
+
+    let reply = backend.decode(&mut reply_wire).unwrap().unwrap();
+    let mut client_out = BytesMut::new();
+    frontend.encode(reply, &mut client_out).unwrap();
+    assert_eq!(reply_original, client_out);
+}
+
+#[test]
+fn negotiate_protocol_version_relay_round_trip() {
+    // Server → proxy → client: NegotiateProtocolVersion ('v') decodes on the
+    // backend codec and re-encodes byte-identically toward the client.
+    let mut reply_wire = BytesMut::new();
+    reply_wire.put_u8(b'v');
+    reply_wire.put_i32(4 + 4 + 4 + 13); // length: itself + minor + count + option
+    reply_wire.put_i32(0); // newest supported minor protocol version
+    reply_wire.put_i32(1); // one unsupported option follows
+    reply_wire.extend_from_slice(b"_pq_.unknown\0");
+    let reply_original = reply_wire.clone();
+
+    let mut frontend = FrontendCodec::post_startup();
+    let mut backend = BackendCodec::new();
+
+    let reply = backend.decode(&mut reply_wire).unwrap().unwrap();
+    let mut client_out = BytesMut::new();
+    frontend.encode(reply, &mut client_out).unwrap();
+    assert_eq!(reply_original, client_out);
 }
 
 #[test]

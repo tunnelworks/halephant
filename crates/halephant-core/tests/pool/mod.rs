@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use halephant_core::config::Config;
 use halephant_core::pool::PoolManager;
+use halephant_core::pool::types::{CheckoutError, classify_checkout_error};
 use halephant_core::topology::{ClusterTopology, TopologyManager};
 
 use halephant_core::clients::{ClientGuard, ClientRegistry};
@@ -87,11 +88,21 @@ async fn checkout_err(pool: &Arc<PoolManager>, db: &str, user: &str) -> String {
 #[tokio::test]
 async fn checkout_unreachable_upstream() {
     let pool = pool_with_max(10);
-    let msg = checkout_err(&pool, "testdb", "user").await;
+    let client = test_client_guard();
+    let err = pool
+        .checkout(&client, "testdb", "user", false)
+        .await
+        .err()
+        .expect("expected checkout to fail for testdb/user");
+    let msg = err.to_string();
     assert!(
         msg.contains("connect") || msg.contains("refused"),
         "error should mention connection failure: {msg}"
     );
+    // A plain connect failure carries no CheckoutError — it falls
+    // through to the `connect_failed` metric classification.
+    assert!(err.downcast_ref::<CheckoutError>().is_none());
+    assert_eq!(classify_checkout_error(&err), "connect_failed");
 }
 
 #[tokio::test]
@@ -131,6 +142,38 @@ async fn checkout_no_primary_discovered() {
         msg.contains("no primary discovered"),
         "missing topology should fail with NoPrimary: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Unconfigured users are refused, never mapped to the client-facing name
+// ---------------------------------------------------------------------------
+
+/// Checkout for a user with no `[cluster.*.pool.*.user.*]` entry is
+/// refused with a typed error, mirroring refill and the frontend's
+/// `is_user_allowed` gate. The old behavior fell back to connecting
+/// upstream as the client-facing name, which let a single pool hold
+/// connections authenticated as different PostgreSQL roles.
+#[tokio::test]
+async fn checkout_unconfigured_user_refused() {
+    let pool = pool_with_max(10);
+    let client = test_client_guard();
+    let err = pool
+        .checkout(&client, "testdb", "mallory", false)
+        .await
+        .err()
+        .expect("expected checkout to refuse the unconfigured user");
+    assert!(
+        matches!(
+            err.downcast_ref::<CheckoutError>(),
+            Some(CheckoutError::UserNotConfigured { .. })
+        ),
+        "refusal should downcast to CheckoutError::UserNotConfigured, got: {err}"
+    );
+    assert!(
+        err.to_string().contains("not configured"),
+        "refusal should say the user is not configured: {err}"
+    );
+    assert_eq!(classify_checkout_error(&err), "user_not_configured");
 }
 
 // ---------------------------------------------------------------------------

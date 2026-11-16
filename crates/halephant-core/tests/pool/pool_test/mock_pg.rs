@@ -35,6 +35,8 @@ pub(crate) struct MockPg {
     received_parses: Arc<Mutex<Vec<String>>>,
     /// Statement names from Close messages the mock has received.
     received_closes: Arc<Mutex<Vec<String>>>,
+    /// The `user` startup parameter of every connection, in accept order.
+    received_startup_users: Arc<Mutex<Vec<String>>>,
 }
 
 /// Controls how the mock responds to queries.
@@ -48,6 +50,10 @@ pub(crate) enum MockBehavior {
     CloseAfterStartup,
     /// Close the connection mid-query (after receiving Query but before responding).
     CloseOnQuery,
+    /// Refuse the startup message with a FATAL ErrorResponse, like
+    /// PostgreSQL during shutdown (`57P03 the database system is
+    /// shutting down`) or recovery.
+    ErrorOnStartup { code: String, message: String },
 }
 
 /// Build a SCRAM verifier from a plaintext password for testing.
@@ -118,9 +124,11 @@ impl MockPg {
         let received_queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let received_parses: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let received_closes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_startup_users: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let queries_for_task = Arc::clone(&received_queries);
         let parses_for_task = Arc::clone(&received_parses);
         let closes_for_task = Arc::clone(&received_closes);
+        let users_for_task = Arc::clone(&received_startup_users);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -133,8 +141,9 @@ impl MockPg {
                         let queries = Arc::clone(&queries_for_task);
                         let parses = Arc::clone(&parses_for_task);
                         let closes = Arc::clone(&closes_for_task);
+                        let users = Arc::clone(&users_for_task);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, behavior, is_replica, response_delay, queries, parses, closes).await {
+                            if let Err(e) = handle_connection(stream, behavior, is_replica, response_delay, queries, parses, closes, users).await {
                                 let _ = e;
                             }
                         });
@@ -152,6 +161,7 @@ impl MockPg {
             received_queries,
             received_parses,
             received_closes,
+            received_startup_users,
         }
     }
 
@@ -182,12 +192,21 @@ impl MockPg {
         self.received_closes.lock().clone()
     }
 
+    /// Snapshot of the `user` startup parameter of every accepted
+    /// connection, in accept order. Lets tests assert which upstream
+    /// role halephant authenticated as.
+    #[allow(dead_code)]
+    pub(crate) fn received_startup_users(&self) -> Vec<String> {
+        self.received_startup_users.lock().clone()
+    }
+
     pub(crate) async fn stop(self) {
         self.shutdown.notify_one();
         let _ = self.handle.await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: TcpStream,
     behavior: MockBehavior,
@@ -196,6 +215,7 @@ async fn handle_connection(
     received_queries: Arc<Mutex<Vec<String>>>,
     received_parses: Arc<Mutex<Vec<String>>>,
     received_closes: Arc<Mutex<Vec<String>>>,
+    received_startup_users: Arc<Mutex<Vec<String>>>,
 ) -> anyhow::Result<()> {
     let mut conn = Framed::new(stream, FrontendCodec::new());
 
@@ -207,7 +227,12 @@ async fn handle_connection(
                 use tokio::io::AsyncWriteExt;
                 conn.get_mut().write_all(b"N").await?;
             }
-            Some(FrontendMessage::Startup(_)) => break,
+            Some(FrontendMessage::Startup(startup)) => {
+                if let Some((_, user)) = startup.parameters.iter().find(|(k, _)| k == "user") {
+                    received_startup_users.lock().push(user.clone());
+                }
+                break;
+            }
             _ => return Ok(()),
         }
     }
@@ -216,6 +241,11 @@ async fn handle_connection(
     match &behavior {
         MockBehavior::ScramAuth(verifier) => {
             scram_server_auth(&mut conn, verifier.clone()).await?;
+        }
+        MockBehavior::ErrorOnStartup { code, message } => {
+            conn.send(BackendMessage::ErrorResponse(fatal_error(code, message)))
+                .await?;
+            return Ok(());
         }
         _ => {
             conn.feed(BackendMessage::AuthenticationOk).await?;
@@ -393,6 +423,18 @@ fn duplicate_prepared(name: &str) -> NoticeFields {
                 b'M',
                 format!("prepared statement \"{name}\" already exists"),
             ),
+        ],
+    }
+}
+
+/// Build a FATAL ErrorResponse like PostgreSQL sends when it refuses a
+/// startup attempt outright (for example `57P03` during shutdown).
+fn fatal_error(code: &str, message: &str) -> NoticeFields {
+    NoticeFields {
+        fields: vec![
+            (b'S', "FATAL".to_owned()),
+            (b'C', code.to_owned()),
+            (b'M', message.to_owned()),
         ],
     }
 }

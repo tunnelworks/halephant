@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::connections::server::ServerConn;
+use crate::errors::ResolveError;
 
 // ---------------------------------------------------------------------------
 // ConnId — unique identifier for a physical connection
@@ -36,6 +37,64 @@ pub(in crate::pool) enum NodeRole {
     Primary,
     Replica,
     Unknown,
+}
+
+// ---------------------------------------------------------------------------
+// CheckoutError — typed checkout failure taxonomy
+// ---------------------------------------------------------------------------
+
+/// A checkout failure originating inside the pool, as opposed to a
+/// resolution failure ([`ResolveError`]) or an upstream connect error
+/// (a bare [`anyhow::Error`] from the connect path).
+///
+/// Metric classification downcasts to this type instead of matching on
+/// error prose, so upstream text such as PostgreSQL's `57P03` message
+/// ("the database system is shutting down") can never masquerade as
+/// halephant's own shutdown. The Display text is operator-facing and
+/// stays stable across releases.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckoutError {
+    /// No connection became available within `checkout_timeout`.
+    #[error("checkout timed out after {timeout:?} for {database}/{user}")]
+    Timeout {
+        timeout: Duration,
+        database: String,
+        user: String,
+    },
+
+    /// Halephant is shutting down; queued waiters abort immediately.
+    #[error("halephant is shutting down")]
+    ShuttingDown,
+
+    /// The user has no `[cluster.*.pool.*.user.*]` entry for the
+    /// database. Checkout and refill both refuse — mirroring the
+    /// frontend's `is_user_allowed` gate — instead of falling back to
+    /// the client-facing name, which could mix connections
+    /// authenticated as different PostgreSQL roles in one pool.
+    #[error("user {user:?} is not configured for database {database:?}")]
+    UserNotConfigured { database: String, user: String },
+}
+
+/// Classifies a checkout failure into the low-cardinality `error.type`
+/// metric label recorded by the checkout path. Typed errors map to
+/// their own labels; anything else — upstream connect failures
+/// included — falls back to `connect_failed`.
+pub fn classify_checkout_error(e: &anyhow::Error) -> &'static str {
+    if let Some(resolve_err) = e.downcast_ref::<ResolveError>() {
+        match resolve_err {
+            ResolveError::UnknownDatabase { .. } => "unknown_database",
+            ResolveError::NoPrimary { .. } => "no_primary",
+            ResolveError::NoReplica { .. } => "no_replica",
+        }
+    } else if let Some(checkout_err) = e.downcast_ref::<CheckoutError>() {
+        match checkout_err {
+            CheckoutError::Timeout { .. } => "checkout_timeout",
+            CheckoutError::ShuttingDown => "shutting_down",
+            CheckoutError::UserNotConfigured { .. } => "user_not_configured",
+        }
+    } else {
+        "connect_failed"
+    }
 }
 
 // ---------------------------------------------------------------------------
