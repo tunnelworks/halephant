@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -47,8 +47,7 @@ struct Cli {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config = Config::load(&cli.config)
@@ -62,6 +61,36 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // `main` stays synchronous so the config is in hand before the
+    // runtime exists: `server.workers` sizes the worker pool, and a
+    // `#[tokio::main]` runtime would already be running by the time the
+    // file is read. Validation (`--check`) never needs a runtime at all.
+    let runtime = build_runtime(config.server.workers).context("failed to build tokio runtime")?;
+    runtime.block_on(run(config, &cli.config))
+}
+
+/// Builds the multi-threaded runtime that hosts the proxy, sized by
+/// `server.workers`.
+///
+/// A `workers` value of `0` — the default, documented as auto-detecting the
+/// CPU count — leaves `worker_threads` unset so the builder applies its own
+/// default of one worker per available core. Any other value pins the pool to
+/// exactly that many worker threads.
+///
+/// The runtime is built once, before anything is spawned, which is why
+/// `server.workers` is restart-required rather than hot-reloadable.
+fn build_runtime(workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if workers > 0 {
+        builder.worker_threads(workers);
+    }
+    builder.enable_all().build()
+}
+
+/// Serves the proxy on the runtime built by [`build_runtime`]: installs
+/// telemetry, warms the pools, accepts clients until SIGINT or SIGTERM, then
+/// drains. `config_path` is the file SIGHUP re-reads.
+async fn run(config: Config, config_path: &Path) -> anyhow::Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| format!("halephant={}", config.logging.level).into());
     let fmt_layer = tracing_subscriber::fmt::layer().with_filter(env_filter);
@@ -365,7 +394,7 @@ async fn main() -> anyhow::Result<()> {
                 info!("received SIGHUP, reloading config");
                 use halephant_core::config::reload::{reload_config, ReloadOutcome};
                 use opentelemetry::KeyValue;
-                match reload_config(&cli.config, &config).await {
+                match reload_config(config_path, &config).await {
                     ReloadOutcome::Success => {
                         reload_counter.add(1, &[KeyValue::new("outcome", "success")]);
                         info!("config reloaded");
@@ -479,4 +508,57 @@ async fn main() -> anyhow::Result<()> {
 
     info!("halephant stopped");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::build_runtime;
+
+    /// Worker count the builder picks on its own, which is what
+    /// `server.workers = 0` must preserve. Reading it from a plain builder
+    /// keeps the assertion honest if tokio changes how it auto-detects.
+    fn builder_default_workers() -> usize {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .metrics()
+            .num_workers()
+    }
+
+    #[test]
+    fn zero_workers_keeps_the_builder_default() {
+        let runtime = build_runtime(0).unwrap();
+        assert_eq!(runtime.metrics().num_workers(), builder_default_workers());
+    }
+
+    #[test]
+    fn explicit_worker_count_sizes_the_runtime() {
+        let runtime = build_runtime(3).unwrap();
+        assert_eq!(runtime.metrics().num_workers(), 3);
+    }
+
+    /// A single worker is a legal setting, not a synonym for auto-detect.
+    #[test]
+    fn one_worker_pins_a_single_thread() {
+        let runtime = build_runtime(1).unwrap();
+        assert_eq!(runtime.metrics().num_workers(), 1);
+    }
+
+    /// The runtime carries the IO and time drivers the proxy needs, so
+    /// `enable_all` has to survive both branches of the worker mapping.
+    #[test]
+    fn runtime_enables_io_and_time_drivers() {
+        for workers in [0, 2] {
+            let runtime = build_runtime(workers).unwrap();
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            });
+        }
+    }
 }
