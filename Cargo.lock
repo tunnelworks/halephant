@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "halephant"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "halephant-core"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arc-swap",
