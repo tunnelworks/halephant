@@ -89,6 +89,8 @@ jobs:
       - name: Create and push manifest
         working-directory: /tmp/digests
         run: |
+          # printf writes one image reference per digest, and each must be an argument of its own.
+          # shellcheck disable=SC2046
           docker buildx imagetools create \
             --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:trunk \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
